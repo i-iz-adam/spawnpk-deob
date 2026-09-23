@@ -36,11 +36,16 @@ public final class CompileFixLoop {
         Path sourceRoot = config.decompiledSourcesDir();
         Path classOutput = config.outputDir().resolve("classes");
         Path vendoredJar = config.vendoredLibsDir().resolve("vendored-unidentified.jar");
-        List<Path> classpath = Files.exists(vendoredJar) ? List.of(vendoredJar) : List.of();
+        List<Path> classpath = new ArrayList<>();
+        if (Files.exists(vendoredJar)) classpath.add(vendoredJar);
+        // Lombok-annotated sources need the annotation types resolvable;
+        // processing stays off (-proc:none), so no code is generated here --
+        // the Gradle build runs the real processor.
+        if (config.lombokJar() != null && Files.exists(config.lombokJar())) classpath.add(config.lombokJar());
         JavacRunner javac = new JavacRunner();
 
         List<IterationSummary> iterations = new ArrayList<>();
-        int previousErrorCount = Integer.MAX_VALUE;
+        Set<String> previousSignatures = null;
 
         for (int i = 1; i <= config.maxFixLoopIterations(); i++) {
             JavacRunner.CompileOutcome outcome = javac.compile(sourceRoot, classOutput, classpath,
@@ -55,21 +60,39 @@ public final class CompileFixLoop {
             var bucketed = bucketer.categorize(outcome.diagnostics());
             int errorsBefore = bucketed.size();
 
+            // Equilibrium detection: identical diagnostic sets across two
+            // iterations mean the fixers are flip-flopping (or fixing one
+            // error per newly revealed one at a steady state) -- stop
+            // instead of burning the remaining budget. Counts alone can't
+            // show this: fixing syntax routinely reveals deeper errors.
+            Set<String> signatures = new HashSet<>();
+            for (var b : bucketed) {
+                var d = b.diagnostic();
+                signatures.add(String.valueOf(d.getSource()) + ":" + d.getLineNumber() + ":" + d.getCode());
+            }
+            if (signatures.equals(previousSignatures)) {
+                iterations.add(new IterationSummary(i, errorsBefore, errorsBefore, 0));
+                LoopReport report = new LoopReport(false, iterations, summarize(outcome.diagnostics()));
+                writeReport(config, report);
+                return report;
+            }
+            previousSignatures = signatures;
+
             int fixesApplied = applyMechanicalFixes(sourceRoot, bucketed);
 
             iterations.add(new IterationSummary(i, errorsBefore, -1 /* filled in next loop */, fixesApplied));
 
-            if (fixesApplied == 0 || errorsBefore >= previousErrorCount) {
-                // No progress this iteration (either nothing was
-                // mechanically fixable, or fixes didn't actually reduce
-                // the error count) -- stop early rather than burn the
-                // remaining iteration budget for nothing.
+            if (fixesApplied == 0) {
+                // Nothing left we know how to fix mechanically -- report the
+                // remainder for a human. Error counts are NOT compared
+                // across iterations: fixing a file's syntax routinely
+                // reveals dozens of deeper attribution errors, so a rising
+                // count is progress, not regress.
                 List<String> remaining = summarize(outcome.diagnostics());
                 LoopReport report = new LoopReport(false, iterations, remaining);
                 writeReport(config, report);
                 return report;
             }
-            previousErrorCount = errorsBefore;
         }
 
         JavacRunner.CompileOutcome finalOutcome = javac.compile(sourceRoot, classOutput, classpath,
@@ -84,15 +107,53 @@ public final class CompileFixLoop {
         int fixes = 0;
 
         var unresolved = grouped.getOrDefault(DiagnosticBucketer.Category.UNRESOLVED_SYMBOL, List.of());
+        int importFixes = 0;
         if (!unresolved.isEmpty()) {
-            fixes += ImportInserter.tryFixAll(sourceRoot, unresolved);
+            importFixes = ImportInserter.tryFixAll(sourceRoot, unresolved);
+            fixes += importFixes;
         }
 
         // Vineflower leaks invokedynamic string concatenation as a literal
         // bootstrap call (StringConcatFactory.makeConcatWithConstants<...>(...))
         // whenever it can't inline the recipe -- valid IR, invalid Java.
         // Recipes are mechanically convertible to plain + chains.
-        fixes += StringConcatFixer.tryFixAll(sourceRoot);
+        int concatFixes = StringConcatFixer.tryFixAll(sourceRoot);
+        fixes += concatFixes;
+
+        // Erased generics surface as Object where a concrete type is needed.
+        // When javac names the target type, an explicit cast restores it.
+        var incompatible = grouped.getOrDefault(DiagnosticBucketer.Category.INCOMPATIBLE_TYPES, List.of());
+        int castFixes = 0;
+        if (!incompatible.isEmpty()) {
+            castFixes = RawCastFixer.tryFixAll(sourceRoot, incompatible);
+            fixes += castFixes;
+        }
+
+        // Vineflower's own printing bugs (redundant cast paren before new,
+        // leaked capture-of inference text) are valid IR but invalid Java.
+        int artifactFixes = DecompilerArtifactFixer.tryFixAll(sourceRoot);
+        fixes += artifactFixes;
+
+        // Vineflower collapses String.compareTo orderings into bare
+        // operators (String > String), which cannot compile; the printed
+        // operator faithfully guides the reconstruction (... > 0).
+        int compareFixes = StringCompareFixer.tryFixAll(sourceRoot, bucketed);
+        fixes += compareFixes;
+
+        // Vineflower inlines synthetic accessors into direct accesses, but
+        // our flat one-file-per-class layout breaks nestmate access: widen.
+        int widenFixes = AccessWidenFixer.tryFixAll(sourceRoot, bucketed);
+        fixes += widenFixes;
+
+        // Decompiler drops precise types to Object; some JDK methods exist
+        // on exactly one receiver type, which names the cast.
+        int receiverFixes = ReceiverCastFixer.tryFixAll(sourceRoot, bucketed);
+        fixes += receiverFixes;
+
+        if (fixes > 0) {
+            System.out.printf("  fixes applied: imports=%d concat=%d casts=%d artifacts=%d compare=%d widen=%d receiver=%d%n",
+                    importFixes, concatFixes, castFixes, artifactFixes, compareFixes, widenFixes, receiverFixes);
+        }
 
         // TODO: DUPLICATE_METHOD -- remove the redundant bridge method
         // (cross-reference Stage 0's BytecodeNormalizer.Warning synthetic/
@@ -162,8 +223,7 @@ public final class CompileFixLoop {
                     // size >1 -> ambiguous, left for a human rather than guessing.
                 }
                 if (!importsToAdd.isEmpty()) {
-                    insertImports(entry.getKey(), importsToAdd);
-                    fixed += importsToAdd.size();
+                    fixed += insertImports(entry.getKey(), importsToAdd);
                 }
             }
             return fixed;
@@ -184,8 +244,22 @@ public final class CompileFixLoop {
             return index;
         }
 
-        private static void insertImports(Path javaFile, Set<String> fqns) throws IOException {
+        private static int insertImports(Path javaFile, Set<String> fqns) throws IOException {
             List<String> lines = new ArrayList<>(Files.readAllLines(javaFile));
+            Set<String> have = new HashSet<>();
+            for (String line : lines) {
+                String trimmed = line.trim();
+                if (trimmed.startsWith("import ")) {
+                    have.add(trimmed.substring("import ".length()).replace(";", "").trim());
+                }
+            }
+            // Drop already-present imports: re-adding them is harmless to
+            // javac but counts as phantom "fixes" that keep a stalled loop
+            // spinning instead of terminating.
+            List<String> newImports = fqns.stream()
+                    .filter(fqn -> !have.contains(fqn))
+                    .map(fqn -> "import " + fqn + ";").toList();
+            if (newImports.isEmpty()) return 0;
             int insertAt = 0;
             for (int i = 0; i < lines.size(); i++) {
                 String trimmed = lines.get(i).trim();
@@ -195,9 +269,618 @@ public final class CompileFixLoop {
                     break;
                 }
             }
-            List<String> newImports = fqns.stream().map(fqn -> "import " + fqn + ";").toList();
             lines.addAll(insertAt, newImports);
             Files.write(javaFile, lines);
+            return newImports.size();
+        }
+    }
+
+    /**
+     * Inserts an explicit cast where type erasure left {@code Object} (or a
+     * wrong raw type) flowing into a concrete target javac names in the
+     * diagnostic ({@code Object cannot be converted to String}). Only
+     * assignment and {@code return} shapes, only when the right-hand side
+     * isn't already parenthesized (keeps the fixer idempotent across loop
+     * iterations). Anything fancier -- argument positions, method-ref
+     * targets javac doesn't name -- stays manual.
+     */
+    static final class RawCastFixer {
+        private static final Pattern CONVERSION = Pattern.compile(
+                "incompatible types: (.+) cannot be converted to (.+)");
+        private static final Map<String, String> BOXED = Map.of(
+                "boolean", "Boolean", "byte", "Byte", "short", "Short",
+                "char", "Character", "int", "Integer", "long", "Long",
+                "float", "Float", "double", "Double");
+
+        static int tryFixAll(Path sourceRoot, List<DiagnosticBucketer.Bucketed> incompatible) throws IOException {
+            Map<Path, List<DiagnosticBucketer.Bucketed>> byFile = new LinkedHashMap<>();
+            for (var b : incompatible) {
+                if (b.diagnostic().getSource() == null) continue;
+                Path file = Path.of(b.diagnostic().getSource().toUri());
+                byFile.computeIfAbsent(file, f -> new ArrayList<>()).add(b);
+            }
+            int fixed = 0;
+            for (var entry : byFile.entrySet()) {
+                List<String> lines;
+                try {
+                    lines = new ArrayList<>(Files.readAllLines(entry.getKey()));
+                } catch (IOException ioe) {
+                    continue;
+                }
+                boolean changed = false;
+                for (var b : entry.getValue()) {
+                    Matcher m = CONVERSION.matcher(b.diagnostic().getMessage(Locale.ENGLISH));
+                    if (!m.find()) continue;
+                    String target = BOXED.getOrDefault(m.group(2).trim(), m.group(2).trim());
+                    int lineNo = (int) b.diagnostic().getLineNumber();
+                    if (lineNo < 1 || lineNo > lines.size()) continue;
+                    String rewritten = tryFixLine(lines.get(lineNo - 1), target);
+                    if (rewritten != null) {
+                        lines.set(lineNo - 1, rewritten);
+                        changed = true;
+                        fixed++;
+                    }
+                }
+                if (changed) Files.write(entry.getKey(), lines);
+            }
+            return fixed;
+        }
+
+        private static String tryFixLine(String line, String castTo) {
+            String code = line;
+            String comment = "";
+            int commentAt = code.indexOf("//");
+            if (commentAt >= 0) {
+                comment = code.substring(commentAt);
+                code = code.substring(0, commentAt);
+            }
+            if (!code.trim().endsWith(";") && !code.trim().endsWith("{")) return null;
+
+            String enhanced = tryFixEnhancedFor(code, castTo);
+            if (enhanced != null) return enhanced + comment;
+
+            Matcher ret = Pattern.compile("^(.*\\breturn\\s+)(.+);\\s*$").matcher(code);
+            if (ret.matches()) {
+                String expr = ret.group(2).trim();
+                // Never stack identical casts (a persisting error with the
+                // right cast already present has its root cause elsewhere).
+                // But a DIFFERENT cast is proven bogus by javac itself --
+                // strip one level and let the loop recheck the bare expr,
+                // provided the parens hold a bare type-ish name rather than
+                // a compound expression (dropping THOSE parens would change
+                // precedence, e.g. (a+b) * c).
+                if (expr.isEmpty()) return null;
+                Matcher exprCast = Pattern.compile("^\\(([^()]*)\\)\\s*(.+)$").matcher(expr);
+                if (exprCast.matches()) {
+                    if (exprCast.group(1).trim().equals(castTo)) return null;
+                    if (isBareTypeName(exprCast.group(1).trim())) {
+                        return ret.group(1) + exprCast.group(2) + ";" + comment;
+                    }
+                    return null;
+                }
+                return ret.group(1) + "(" + castTo + ") " + expr + ";" + comment;
+            }
+
+            int eq = lastTopLevelEquals(code);
+            if (eq < 0) return null;
+            String rhs = code.substring(eq + 1, code.lastIndexOf(';')).trim();
+            if (rhs.isEmpty()) return null;
+            Matcher rhsCast = Pattern.compile("^\\(([^()]*)\\)\\s*(.+)$").matcher(rhs);
+            if (rhsCast.matches()) {
+                if (rhsCast.group(1).trim().equals(castTo)) return null;
+                if (isBareTypeName(rhsCast.group(1).trim())) {
+                    return code.substring(0, eq + 1) + " " + rhsCast.group(2) + ";" + comment;
+                }
+                return null;
+            }
+            return code.substring(0, eq + 1) + " (" + castTo + ") " + rhs + ";" + comment;
+        }
+
+        /** True for atomic type-ish names a redundant paren pair can be
+         *  dropped around without precedence effects: identifiers, dotted
+         *  names, arrays, simple generics. Anything with operators is a
+         *  real subexpression -- hands off. {@code new X} and
+         *  {@code (void)} are excluded (dropping those parens breaks the
+         *  expression that follows). */
+        private static boolean isBareTypeName(String inside) {
+            if (inside.isEmpty()) return false;
+            String first = inside.split("[\\s<\\[]", 2)[0];
+            if (first.equals("new") || first.equals("void")) return false;
+            for (int i = 0; i < inside.length(); i++) {
+                char c = inside.charAt(i);
+                if (Character.isJavaIdentifierPart(c) || c == '.' || c == '[' || c == ']'
+                        || c == '<' || c == '>' || c == ',' || c == '?' || Character.isWhitespace(c)) {
+                    continue;
+                }
+                return false;
+            }
+            return true;
+        }
+
+        /** {@code for (T v : EXPR)} over a raw iterable: javac reports the
+         *  element mismatch ({@code Object cannot be converted to T}).
+         *  Casting the iterated expression to {@code Iterable<T>} restores
+         *  it; primitives box ({@code Iterable<Integer>}). Skipped for
+         *  C-style headers (top-level {@code ;}) and already-cast heads. */
+        private static String tryFixEnhancedFor(String code, String target) {
+            int forAt = indexOfWord(code, "for");
+            if (forAt < 0) return null;
+            int open = code.indexOf('(', forAt);
+            if (open < 0) return null;
+            int close = findMatchingParen(code, open);
+            if (close < 0) return null;
+            String header = code.substring(open + 1, close);
+            if (header.indexOf(';') >= 0) return null; // C-style loop
+            int colon = topLevelChar(header, ':');
+            if (colon < 0) return null;
+            String decl = header.substring(0, colon).trim();
+            String expr = header.substring(colon + 1).trim();
+            if (decl.isEmpty() || expr.isEmpty() || !decl.contains(" ")) return null;
+            String boxed = BOXED.getOrDefault(target.trim(), target.trim());
+            String castTo = "Iterable<" + boxed + ">";
+            if (expr.startsWith("(" + castTo + ")")) return null;
+            return code.substring(0, open + 1) + decl + " : (" + castTo + ") " + expr + code.substring(close);
+        }
+
+        private static int indexOfWord(String code, String word) {
+            int at = code.indexOf(word);
+            while (at >= 0) {
+                boolean beforeOk = at == 0 || !Character.isJavaIdentifierPart(code.charAt(at - 1));
+                int end = at + word.length();
+                boolean afterOk = end >= code.length() || !Character.isJavaIdentifierPart(code.charAt(end));
+                if (beforeOk && afterOk) return at;
+                at = code.indexOf(word, at + 1);
+            }
+            return -1;
+        }
+
+        private static int findMatchingParen(String code, int open) {
+            int depth = 0;
+            boolean inStr = false;
+            boolean inChr = false;
+            for (int i = open; i < code.length(); i++) {
+                char c = code.charAt(i);
+                if (inStr) {
+                    if (c == '\\') i++;
+                    else if (c == '"') inStr = false;
+                    continue;
+                }
+                if (inChr) {
+                    if (c == '\\') i++;
+                    else if (c == '\'') inChr = false;
+                    continue;
+                }
+                if (c == '"') inStr = true;
+                else if (c == '\'') inChr = true;
+                else if (c == '(') depth++;
+                else if (c == ')') {
+                    depth--;
+                    if (depth == 0) return i;
+                }
+            }
+            return -1;
+        }
+
+        private static int topLevelChar(String code, char want) {            int depthParen = 0, depthBracket = 0, depthBrace = 0;
+            boolean inStr = false;
+            boolean inChr = false;
+            for (int i = 0; i < code.length(); i++) {
+                char c = code.charAt(i);
+                if (inStr) {
+                    if (c == '\\') i++;
+                    else if (c == '"') inStr = false;
+                    continue;
+                }
+                if (inChr) {
+                    if (c == '\\') i++;
+                    else if (c == '\'') inChr = false;
+                    continue;
+                }
+                switch (c) {
+                    case '"' -> inStr = true;
+                    case '\'' -> inChr = true;
+                    case '(' -> depthParen++;
+                    case ')' -> depthParen--;
+                    case '[' -> depthBracket++;
+                    case ']' -> depthBracket--;
+                    case '{' -> depthBrace++;
+                    case '}' -> depthBrace--;
+                    default -> {
+                        if (c == want && depthParen == 0 && depthBracket == 0 && depthBrace == 0) return i;
+                    }
+                }
+            }
+            return -1;
+        }
+
+        private static int lastTopLevelEquals(String code) {
+            int depthParen = 0, depthBracket = 0, depthBrace = 0;
+            boolean inStr = false;
+            boolean inChr = false;
+            int found = -1;
+            for (int i = 0; i < code.length(); i++) {
+                char c = code.charAt(i);
+                if (inStr) {
+                    if (c == '\\') i++;
+                    else if (c == '"') inStr = false;
+                    continue;
+                }
+                if (inChr) {
+                    if (c == '\\') i++;
+                    else if (c == '\'') inChr = false;
+                    continue;
+                }
+                switch (c) {
+                    case '"' -> inStr = true;
+                    case '\'' -> inChr = true;
+                    case '(' -> depthParen++;
+                    case ')' -> depthParen--;
+                    case '[' -> depthBracket++;
+                    case ']' -> depthBracket--;
+                    case '{' -> depthBrace++;
+                    case '}' -> depthBrace--;
+                    case '=' -> {
+                        if (depthParen == 0 && depthBracket == 0 && depthBrace == 0
+                                && !isRelationalEquals(code, i)) {
+                            found = i;
+                        }
+                    }
+                    default -> { }
+                }
+            }
+            return found;
+        }
+
+        private static boolean isRelationalEquals(String code, int i) {
+            char prev = i > 0 ? code.charAt(i - 1) : 0;
+            char next = i + 1 < code.length() ? code.charAt(i + 1) : 0;
+            return prev == '=' || prev == '!' || prev == '<' || prev == '>'
+                    || next == '=';
+        }
+    }
+
+    /** Last top-level {@code =} (skipping {@code ==/!=/<=/>=}), or -1.
+     *  Shared by the line-scoped fixers below. */
+    static int lastTopLevelEquals(String code) {
+        int depthParen = 0, depthBracket = 0, depthBrace = 0;
+        boolean inStr = false;
+        boolean inChr = false;
+        int found = -1;
+        for (int i = 0; i < code.length(); i++) {
+            char c = code.charAt(i);
+            if (inStr) {
+                if (c == '\\') i++;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            if (inChr) {
+                if (c == '\\') i++;
+                else if (c == '\'') inChr = false;
+                continue;
+            }
+            switch (c) {
+                case '"' -> inStr = true;
+                case '\'' -> inChr = true;
+                case '(' -> depthParen++;
+                case ')' -> depthParen--;
+                case '[' -> depthBracket++;
+                case ']' -> depthBracket--;
+                case '{' -> depthBrace++;
+                case '}' -> depthBrace--;
+                case '=' -> {
+                    if (depthParen == 0 && depthBracket == 0 && depthBrace == 0
+                            && !isTopRelationalEquals(code, i)) {
+                        found = i;
+                    }
+                }
+                default -> { }
+            }
+        }
+        return found;
+    }
+
+    private static boolean isTopRelationalEquals(String code, int i) {
+        char prev = i > 0 ? code.charAt(i - 1) : 0;
+        char next = i + 1 < code.length() ? code.charAt(i + 1) : 0;
+        return prev == '=' || prev == '!' || prev == '<' || prev == '>'
+                || next == '=';
+    }
+
+    /**
+     * Repairs two Vineflower printing bugs, both valid IR but invalid Java:
+     * redundant cast paren doublets ({@code (pkg.Type)) new TreeMap(...)},
+     * including doubled identical casts ({@code (A) (B)) (B) new ...},
+     * whose phantom inner copies are dropped) and leaked capture-of
+     * inference text ({@code (capture#3 of ? super T) expr}). Collapsing a
+     * double paren is semantics-preserving (it can only ever be redundant);
+     * a {@code #} name can never be a real type, so that cast was bogus and
+     * the expression is rechecked bare. Line-scoped, idempotent.
+     */
+    static final class DecompilerArtifactFixer {
+        private static final Pattern DOUBLE_PAREN_NEW =
+                Pattern.compile("\\(([\\w.$]+)\\)\\)(\\s*)new\\b");
+        // A duplicated cast before new, e.g. (A) (B)) (B) new TreeMap(...):
+        // Vineflower smeared the outer type into a phantom inner cast that
+        // can even be inconvertible. Both copies go; the outer cast stays.
+        private static final Pattern DOUBLED_CAST_BEFORE_NEW =
+                Pattern.compile("\\(([\\w.$]+)\\)\\)\\s*\\(\\1\\)\\s*(?=new\\b)");
+        private static final Pattern CAPTURE_CAST =
+                Pattern.compile("\\(capture#\\d+ of [^()]*\\)\\s*");
+
+        static int tryFixAll(Path sourceRoot) throws IOException {
+            int fixed = 0;
+            try (Stream<Path> walk = Files.walk(sourceRoot)) {
+                for (Path p : (Iterable<Path>) walk.filter(p -> p.toString().endsWith(".java"))::iterator) {
+                    List<String> lines = Files.readAllLines(p);
+                    boolean changed = false;
+                    for (int i = 0; i < lines.size(); i++) {
+                        String line = lines.get(i);
+                        String rewritten = DOUBLE_PAREN_NEW.matcher(line).replaceAll("($1)$2new");
+                        rewritten = DOUBLED_CAST_BEFORE_NEW.matcher(rewritten).replaceAll("");
+                        rewritten = CAPTURE_CAST.matcher(rewritten).replaceAll("");
+                        if (!rewritten.equals(line)) {
+                            lines.set(i, rewritten);
+                            changed = true;
+                            fixed++;
+                        }
+                    }
+                    if (changed) Files.write(p, lines);
+                }
+            }
+            return fixed;
+        }
+    }
+
+    /**
+     * Widens {@code private} declarations whose cross-class users the
+     * decompiler emits as direct accesses. In bytecode this access is legal
+     * (nestmates, or synthetic accessors Vineflower inlined away), but our
+     * flat one-file-per-class layout is not a nest, so javac rejects it --
+     * and package-private is not enough either, since users routinely sit
+     * in other packages. Straight to {@code public}: widening only, no
+     * behavior change for direct access. Line-scoped on the declaring file,
+     * idempotent.
+     */
+    static final class AccessWidenFixer {
+        private static final Pattern PRIVATE_ACCESS =
+                Pattern.compile("(.+) has private access in ([\\w.$]+)");
+
+        static int tryFixAll(Path sourceRoot, List<DiagnosticBucketer.Bucketed> bucketed) throws IOException {
+            int fixed = 0;
+            for (var b : bucketed) {
+                Matcher m = PRIVATE_ACCESS.matcher(b.diagnostic().getMessage(Locale.ENGLISH));
+                if (!m.find()) continue;
+                String member = m.group(1).trim();
+                String owner = m.group(2).trim();
+                Path file = sourceRoot.resolve(owner.replace('.', '/') + ".java");
+                if (!Files.exists(file)) continue;
+                if (widen(file, member)) fixed++;
+            }
+            return fixed;
+        }
+
+        private static boolean widen(Path javaFile, String member) throws IOException {
+            List<String> lines = new ArrayList<>(Files.readAllLines(javaFile));
+            Pattern decl = Pattern.compile(
+                    "^(\\s*)private(\\s+.*\\b" + Pattern.quote(member) + "\\b\\s*[=(;])");
+            for (int i = 0; i < lines.size(); i++) {
+                Matcher m = decl.matcher(lines.get(i));
+                if (m.find()) {
+                    lines.set(i, m.group(1) + "public" + m.group(2));
+                    Files.write(javaFile, lines);
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Reconstructs {@code (a.compareTo(b) OP 0)} from Vineflower's
+     * collapsed {@code a OP b} on Strings (ordering operators only --
+     * {@code ==} is legal as printed and never reaches this fixer).
+     * Diagnostic-driven: only lines javac flags with String/String
+     * operands, assignment or {@code return} shape, single top-level
+     * operator. Idempotent (no bare ordering op remains afterwards).
+     */
+    static final class StringCompareFixer {
+        private static final Pattern BAD_OPERAND = Pattern.compile(
+                "bad operand types for binary operator '([><]=?)'");
+
+        static int tryFixAll(Path sourceRoot, List<DiagnosticBucketer.Bucketed> bucketed) throws IOException {
+            Map<Path, List<DiagnosticBucketer.Bucketed>> byFile = new LinkedHashMap<>();
+            for (var b : bucketed) {
+                Matcher m = BAD_OPERAND.matcher(b.diagnostic().getMessage(Locale.ENGLISH));
+                if (!m.find()) continue;
+                String message = b.diagnostic().getMessage(Locale.ENGLISH);
+                if (!message.contains("first type:  java.lang.String")
+                        || !message.contains("second type: java.lang.String")) {
+                    continue;
+                }
+                if (b.diagnostic().getSource() == null) continue;
+                byFile.computeIfAbsent(Path.of(b.diagnostic().getSource().toUri()),
+                        f -> new ArrayList<>()).add(b);
+            }
+            int fixed = 0;
+            for (var entry : byFile.entrySet()) {
+                List<String> lines;
+                try {
+                    lines = new ArrayList<>(Files.readAllLines(entry.getKey()));
+                } catch (IOException ioe) {
+                    continue;
+                }
+                boolean changed = false;
+                for (var b : entry.getValue()) {
+                    Matcher m = BAD_OPERAND.matcher(b.diagnostic().getMessage(Locale.ENGLISH));
+                    if (!m.find()) continue;
+                    int lineNo = (int) b.diagnostic().getLineNumber();
+                    if (lineNo < 1 || lineNo > lines.size()) continue;
+                    String rewritten = tryFixLine(lines.get(lineNo - 1), m.group(1));
+                    if (rewritten != null) {
+                        lines.set(lineNo - 1, rewritten);
+                        changed = true;
+                        fixed++;
+                    }
+                }
+                if (changed) Files.write(entry.getKey(), lines);
+            }
+            return fixed;
+        }
+
+        private static String tryFixLine(String line, String operator) {
+            String code = line;
+            String comment = "";
+            int commentAt = code.indexOf("//");
+            if (commentAt >= 0) {
+                comment = code.substring(commentAt);
+                code = code.substring(0, commentAt);
+            }
+            String tail;
+            String head;
+            Matcher ret = Pattern.compile("^(.*\\breturn\\s+)(.+);\\s*$").matcher(code);
+            int eq = lastTopLevelEquals(code);
+            if (ret.matches()) {
+                head = ret.group(1);
+                tail = ret.group(2);
+            } else if (eq >= 0) {
+                head = code.substring(0, eq + 1) + " ";
+                tail = code.substring(eq + 1, code.lastIndexOf(';'));
+            } else {
+                return null;
+            }
+            int op = topLevelOperator(tail, operator);
+            if (op < 0) return null;
+            String left = tail.substring(0, op).trim();
+            String right = tail.substring(op + operator.length()).trim();
+            if (left.isEmpty() || right.isEmpty()) return null;
+            return head + "(" + left + ".compareTo(" + right + ") " + operator + " 0);" + comment;
+        }
+
+        private static int topLevelOperator(String code, String operator) {
+            int depthParen = 0, depthBracket = 0, depthBrace = 0;
+            boolean inStr = false;
+            boolean inChr = false;
+            for (int i = 0; i + operator.length() <= code.length(); i++) {
+                char c = code.charAt(i);
+                if (inStr) {
+                    if (c == '\\') i++;
+                    else if (c == '"') inStr = false;
+                    continue;
+                }
+                if (inChr) {
+                    if (c == '\\') i++;
+                    else if (c == '\'') inChr = false;
+                    continue;
+                }
+                switch (c) {
+                    case '"' -> inStr = true;
+                    case '\'' -> inChr = true;
+                    case '(' -> depthParen++;
+                    case ')' -> depthParen--;
+                    case '[' -> depthBracket++;
+                    case ']' -> depthBracket--;
+                    case '{' -> depthBrace++;
+                    case '}' -> depthBrace--;
+                    default -> {
+                        if ((c == '>' || c == '<') && depthParen == 0 && depthBracket == 0 && depthBrace == 0
+                                && code.startsWith(operator, i)) {
+                            return i;
+                        }
+                    }
+                }
+            }
+            return -1;
+        }
+    }
+
+    /**
+     * Casts an {@code Object}-typed receiver to the one JDK type that
+     * declares the called method, for a curated set of unambiguous
+     * (name, arity) pairs: {@code split(String)} and {@code toCharArray()}
+     * exist only on {@code String}; {@code exists/mkdir/mkdirs/delete} only
+     * on {@code java.io.File}. Diagnostic-driven
+     * ({@code symbol: method m(..) / location: variable v of type ...}),
+     * receiver must be a simple dotted path (no chains). Idempotent.
+     */
+    static final class ReceiverCastFixer {
+        private static final Pattern NO_SUCH_METHOD = Pattern.compile(
+                "cannot find symbol\\s+symbol:\\s+method (\\w+)\\(([^)]*)\\)\\s+location:\\s+variable (\\w+) of type");
+        private static final Map<String, String> RECEIVER_TYPE = Map.of(
+                "split/1", "java.lang.String",
+                "toCharArray/0", "java.lang.String",
+                "intern/0", "java.lang.String",
+                "exists/0", "java.io.File",
+                "mkdir/0", "java.io.File",
+                "mkdirs/0", "java.io.File",
+                "delete/0", "java.io.File",
+                "createNewFile/0", "java.io.File",
+                "listFiles/0", "java.io.File");
+
+        static int tryFixAll(Path sourceRoot, List<DiagnosticBucketer.Bucketed> bucketed) throws IOException {
+            Map<Path, List<String[]>> byFile = new LinkedHashMap<>();
+            for (var b : bucketed) {
+                Matcher m = NO_SUCH_METHOD.matcher(b.diagnostic().getMessage(Locale.ENGLISH));
+                if (!m.find() || b.diagnostic().getSource() == null) continue;
+                String key = m.group(1) + "/" + arity(m.group(2));
+                String target = RECEIVER_TYPE.get(key);
+                if (target == null) continue;
+                byFile.computeIfAbsent(Path.of(b.diagnostic().getSource().toUri()), f -> new ArrayList<>())
+                        .add(new String[]{m.group(3), m.group(1), target,
+                                String.valueOf(b.diagnostic().getLineNumber())});
+            }
+            int fixed = 0;
+            for (var entry : byFile.entrySet()) {
+                List<String> lines;
+                try {
+                    lines = new ArrayList<>(Files.readAllLines(entry.getKey()));
+                } catch (IOException ioe) {
+                    continue;
+                }
+                boolean changed = false;
+                for (String[] job : entry.getValue()) {
+                    int lineNo;
+                    try {
+                        lineNo = Integer.parseInt(job[3]);
+                    } catch (NumberFormatException nfe) {
+                        continue;
+                    }
+                    if (lineNo < 1 || lineNo > lines.size()) continue;
+                    String rewritten = tryFixLine(lines.get(lineNo - 1), job[0], job[1], job[2]);
+                    if (rewritten != null) {
+                        lines.set(lineNo - 1, rewritten);
+                        changed = true;
+                        fixed++;
+                    }
+                }
+                if (changed) Files.write(entry.getKey(), lines);
+            }
+            return fixed;
+        }
+
+        private static int arity(String params) {
+            if (params.trim().isEmpty()) return 0;
+            int depth = 0;
+            int count = 1;
+            for (int i = 0; i < params.length(); i++) {
+                char c = params.charAt(i);
+                if (c == '<') depth++;
+                else if (c == '>') depth--;
+                else if (c == ',' && depth == 0) count++;
+            }
+            return count;
+        }
+
+        private static String tryFixLine(String line, String receiver, String method, String target) {
+            // receiver.method( -- receiver a simple dotted path; already-cast
+            // receivers are skipped for idempotence.
+            Pattern call = Pattern.compile(
+                    "(?<![\\w.$])" + Pattern.quote(receiver) + "\\s*\\.\\s*" + Pattern.quote(method) + "\\s*\\(");
+            Matcher m = call.matcher(line);
+            if (!m.find()) return null;
+            String before = line.substring(0, m.start());
+            if (before.trim().endsWith(")")) return null;
+            return before + "((" + target + ") " + receiver + ")." + method + "("
+                    + line.substring(m.end());
         }
     }
 
@@ -235,9 +918,19 @@ public final class CompileFixLoop {
             for (int i = 0; i < lines.size(); i++) {
                 String line = lines.get(i);
                 if (!line.contains(MARKER)) continue;
-                String rewritten = rewriteLine(line);
+                // The bootstrap call often spans several lines; join
+                // continuations (bounded) and rewrite as one + chain,
+                // blanking the consumed continuation lines.
+                String joined = line;
+                int end = i;
+                String rewritten = rewriteLine(joined);
+                while (rewritten == null && end - i < 15 && end + 1 < lines.size()) {
+                    joined += " " + lines.get(++end).trim();
+                    rewritten = rewriteLine(joined);
+                }
                 if (rewritten != null) {
                     lines.set(i, rewritten);
+                    for (int j = i + 1; j <= end; j++) lines.set(j, "");
                     changed = true;
                     fixed++;
                 }

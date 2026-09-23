@@ -22,4 +22,11 @@ public record RenameEntry(
      *  full-class override), or is the caller's own {@code --own-package}
      *  root kept exactly as typed, rather than being auto-generated. */
     public static final String REASON_CUSTOM_OVERRIDE = "custom-override";
+    /** Out-of-scope library type that shared its path with a package
+     *  (e.g. shaded trove's interface {@code gnu/trove/f} vs. package
+     *  {@code gnu/trove/f/}): javac always resolves the type, making the
+     *  package unreachable in source. The type keeps its package and gains
+     *  a suffix; the package side is untouched. See
+     *  {@link com.cleandecompile.stage0.LibraryClashRepair}. */
+    public static final String REASON_LIBRARY_CLASH = "library-package-clash";
 }

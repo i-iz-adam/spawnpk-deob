@@ -36,6 +36,10 @@ public final class Stage1Runner {
         // poison Stage 4 with duplicate/phantom sources.
         deleteTree(config.decompiledSourcesDir());
 
+        // Hand-written shims first: decompiled output wins any path
+        // collision, since it reflects the jar's actual contents.
+        copyExtraSources(config);
+
         Map<String, byte[]> byInternalName = new HashMap<>();
         for (ClassInfo ci : normalizedClasses) byInternalName.put(ci.internalName(), ci.bytes());
         Function<String, byte[]> bytesProvider = byInternalName::get;
@@ -78,6 +82,21 @@ public final class Stage1Runner {
                 Files.delete(p);
             }
         }
+    }
+
+    private static void copyExtraSources(PipelineConfig config) throws IOException {
+        Path extra = config.extraSources();
+        if (extra == null) return;
+        int copied = 0;
+        try (var walk = Files.walk(extra)) {
+            for (Path p : (Iterable<Path>) walk.filter(p -> p.toString().endsWith(".java"))::iterator) {
+                Path out = config.decompiledSourcesDir().resolve(extra.relativize(p).toString());
+                Files.createDirectories(out.getParent());
+                Files.copy(p, out);
+                copied++;
+            }
+        }
+        if (copied > 0) System.out.printf("  %d extra source shims copied%n", copied);
     }
 
     private void writeManifest(PipelineConfig config, List<DecompileResult> results) throws IOException {

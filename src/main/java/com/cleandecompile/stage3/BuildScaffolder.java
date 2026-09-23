@@ -84,6 +84,11 @@ public final class BuildScaffolder {
             }
         }
 
+        if (usesLombok(config)) {
+            sb.append("    compileOnly 'org.projectlombok:lombok:1.18.32'\n");
+            sb.append("    annotationProcessor 'org.projectlombok:lombok:1.18.32'\n");
+        }
+
         Path relativeVendored = config.projectDir().relativize(vendoredJar);
         sb.append("    implementation files('").append(relativeVendored.toString().replace('\\', '/')).append("')\n");
         sb.append("}\n\n");
@@ -97,6 +102,29 @@ public final class BuildScaffolder {
 
     private static String javaVersionLiteral(String releaseLevel) {
         return releaseLevel.equals("8") ? "VERSION_1_8" : "VERSION_" + releaseLevel;
+    }
+
+    /** True when any decompiled source imports Lombok (annotations are
+     *  compileable from the jar alone, but code generation needs the real
+     *  processor -- hence compileOnly + annotationProcessor in Gradle). */
+    private static boolean usesLombok(PipelineConfig config) {
+        Path src = config.projectDir().resolve("src/main/java");
+        if (!Files.exists(src)) return false;
+        try (var walk = Files.walk(src)) {
+            for (Path p : (Iterable<Path>) walk.filter(p -> p.toString().endsWith(".java"))::iterator) {
+                try (var lines = Files.lines(p)) {
+                    if (lines.anyMatch(l -> l.startsWith("import lombok.")
+                            || l.startsWith("import static lombok."))) {
+                        return true;
+                    }
+                } catch (IOException ignored) {
+                    // unreadable file -- keep scanning the rest
+                }
+            }
+        } catch (IOException ignored) {
+            // no source tree yet -- no Lombok
+        }
+        return false;
     }
 
     private void writeSettingsGradle(PipelineConfig config) throws IOException {

@@ -66,7 +66,11 @@ public final class JavacRunner {
             List<String> options = List.of(
                     "-nowarn",
                     "-proc:none",
-                    "--release", releaseLevel
+                    "--release", releaseLevel,
+                    // javac stops at 100 errors by default, which silently
+                    // caps the fix loop's view (and its progress check) on
+                    // large deobfuscation trees -- see everything instead.
+                    "-Xmaxerrs", "5000"
             );
 
             JavaCompiler.CompilationTask task =

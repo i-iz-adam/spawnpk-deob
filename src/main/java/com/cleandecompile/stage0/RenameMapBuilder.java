@@ -14,12 +14,11 @@ import java.util.Set;
  * Builds the global old-internal-name -&gt; new-internal-name map that
  * {@link BytecodeNormalizer} feeds straight into {@link QualifiedRemapper}.
  *
- * <p>Only in-scope classes end up with rename entries -- that's what keeps
- * bundled libraries byte-identical. The actual collision/legality
- * resolution is delegated to {@link PackageTree}, which resolves names as
- * a tree (sibling vs. sibling, level by level) rather than patching
- * classes independently -- see its class-level javadoc for why that
- * matters for the classic package/class-name collision.
+ * <p>In-scope classes get rename entries via {@link PackageTree} (which
+ * resolves names as a tree rather than patching classes independently).
+ * Out-of-scope classes keep their names -- EXCEPT the handful that share
+ * their path with a package ({@link LibraryClashRepair}), which javac
+ * cannot express in source at all.
  *
  * <p>{@link CustomNameOverrides} only ever applies to in-scope classes --
  * consulting it for an out-of-scope class would ask {@link PackageTree} to
@@ -54,6 +53,10 @@ public final class RenameMapBuilder {
         for (var p : placements) {
             renameMap.put(p.originalInternalName(), p.newInternalName());
             manifest.add(new RenameEntry(p.originalInternalName(), p.newInternalName(), p.reason()));
+        }
+        for (var e : LibraryClashRepair.repair(allClasses).entrySet()) {
+            renameMap.put(e.getKey(), e.getValue());
+            manifest.add(new RenameEntry(e.getKey(), e.getValue(), RenameEntry.REASON_LIBRARY_CLASH));
         }
         return new Result(renameMap, manifest);
     }

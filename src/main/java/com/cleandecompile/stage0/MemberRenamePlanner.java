@@ -3,7 +3,10 @@ package com.cleandecompile.stage0;
 import com.cleandecompile.model.ClassInfo;
 import com.cleandecompile.model.MemberRenameEntry;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -50,7 +53,56 @@ public final class MemberRenamePlanner {
         planFields(allClasses, byName, overrides, fieldRenameMap, manifest);
         planMethods(byName, overrides, methodRenameMap, manifest);
 
+        // Bytecode names the STATIC receiver type in member refs, which is
+        // often a subclass that merely inherits the member (Client.hQ where
+        // hQ is declared in superclass C). The remapper looks up the ref's
+        // owner verbatim, so without these inherited-owner aliases the
+        // declaration renames while some usages don't -- "cannot find
+        // symbol" in every file that touches them. Aliases are map-only
+        // (no manifest entries: nothing new was renamed).
+        propagateToSubclasses(fieldRenameMap, byName, true);
+        propagateToSubclasses(methodRenameMap, byName, false);
+
         return new Result(methodRenameMap, fieldRenameMap, manifest);
+    }
+
+    private void propagateToSubclasses(Map<String, String> renameMap, Map<String, RawClassHeader> byName,
+                                       boolean fields) {
+        Map<String, List<String>> children = new HashMap<>();
+        for (RawClassHeader hdr : byName.values()) {
+            if (hdr.superName != null) {
+                children.computeIfAbsent(hdr.superName, k -> new ArrayList<>()).add(hdr.internalName);
+            }
+            for (String itf : hdr.interfaces) {
+                children.computeIfAbsent(itf, k -> new ArrayList<>()).add(hdr.internalName);
+            }
+        }
+
+        List<Map.Entry<String, String>> entries = new ArrayList<>(renameMap.entrySet());
+        entries.sort(Map.Entry.comparingByKey());
+        for (var entry : entries) {
+            MemberKeyParts.Parts parts = fields
+                    ? MemberKeyParts.parseFieldKey(entry.getKey())
+                    : MemberKeyParts.parseMethodKey(entry.getKey());
+            Deque<String> queue = new ArrayDeque<>(children.getOrDefault(parts.owner(), List.of()));
+            Set<String> visited = new HashSet<>();
+            while (!queue.isEmpty()) {
+                String sub = queue.removeFirst();
+                if (!visited.add(sub)) continue;
+                RawClassHeader subHdr = byName.get(sub);
+                if (subHdr == null) continue;
+                boolean hides = fields
+                        ? subHdr.declaresField(parts.name(), parts.descriptor())
+                        : subHdr.declaresMethod(parts.name(), parts.descriptor());
+                if (!hides) {
+                    String subKey = fields
+                            ? MemberKeyParts.fieldKey(sub, parts.name(), parts.descriptor())
+                            : MemberKeyParts.methodKey(sub, parts.name(), parts.descriptor());
+                    renameMap.putIfAbsent(subKey, entry.getValue());
+                }
+                queue.addAll(children.getOrDefault(sub, List.of()));
+            }
+        }
     }
 
     private void planFields(List<ClassInfo> allClasses, Map<String, RawClassHeader> byName,
@@ -145,6 +197,17 @@ public final class MemberRenamePlanner {
                 addKeptMethods(members, reason, manifest);
                 continue;
             }
+            if (isAnnotationFamily(members, byName)) {
+                // Annotation elements are referenced by bare name string in
+                // every usage site's bytecode -- the remapper only rewrites
+                // symbolic refs, so a rename would silently detach all
+                // usages. Not even a custom override can fix that up.
+                String reason = (customName != null || explicitKeep)
+                        ? MemberRenameEntry.REASON_CUSTOM_OVERRIDE_IGNORED
+                        : MemberRenameEntry.REASON_ANNOTATION_ELEMENT;
+                addKeptMethods(members, reason, manifest);
+                continue;
+            }
             if (explicitKeep) {
                 // Explicit keep wins over heuristic external-touch poison
                 // (the caller knows the name is safe); hard poison above
@@ -189,6 +252,14 @@ public final class MemberRenamePlanner {
             MemberKeyParts.Parts parts = MemberKeyParts.parseMethodKey(memberKey);
             manifest.add(MemberRenameEntry.keptMethod(parts.owner(), parts.name(), parts.descriptor(), reason));
         }
+    }
+
+    private boolean isAnnotationFamily(Set<String> members, Map<String, RawClassHeader> byName) {
+        for (String memberKey : members) {
+            RawClassHeader owner = byName.get(MemberKeyParts.parseMethodKey(memberKey).owner());
+            if (owner != null && owner.isAnnotation) return true;
+        }
+        return false;
     }
 
     private boolean isKeepable(String name, CustomNameOverrides overrides) {

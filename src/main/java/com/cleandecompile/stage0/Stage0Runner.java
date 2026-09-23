@@ -74,7 +74,8 @@ public final class Stage0Runner {
         System.out.println("  normalizing bytecode (this is the slow step on large jars)...");
         BytecodeNormalizer.Result normResult = new BytecodeNormalizer().normalizeAll(
                 loaded.classes(), classRenameResult.renameMap(),
-                memberRenameResult.methodRenameMap(), memberRenameResult.fieldRenameMap());
+                memberRenameResult.methodRenameMap(), memberRenameResult.fieldRenameMap(),
+                config.decompileLibraries());
         System.out.printf("  normalization done in %.1fs%n", elapsedSec(t3));
 
         writeJar(config, normResult.normalizedClasses(), loaded.resources());

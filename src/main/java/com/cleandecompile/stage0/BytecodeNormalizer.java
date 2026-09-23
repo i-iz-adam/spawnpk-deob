@@ -76,7 +76,8 @@ public final class BytecodeNormalizer {
     private record TypeInfo(String superName, List<String> interfaces, boolean isInterface) {}
 
     public Result normalizeAll(List<ClassInfo> allClasses, Map<String, String> classRenameMap,
-                                Map<String, String> methodRenameMap, Map<String, String> fieldRenameMap) {
+                                Map<String, String> methodRenameMap, Map<String, String> fieldRenameMap,
+                                boolean stripSyntheticForLibraries) {
         Map<String, TypeInfo> typeHierarchy = buildTypeHierarchy(allClasses, classRenameMap);
         QualifiedRemapper remapper = new QualifiedRemapper(classRenameMap, methodRenameMap, fieldRenameMap);
         List<ClassInfo> out = new ArrayList<>(allClasses.size());
@@ -93,7 +94,8 @@ public final class BytecodeNormalizer {
             }
             try {
                 String newName = classRenameMap.getOrDefault(ci.internalName(), ci.internalName());
-                byte[] normalized = normalizeOne(ci, remapper, typeHierarchy, warnings, false);
+                byte[] normalized = normalizeOne(ci, remapper, typeHierarchy, warnings, false,
+                        ci.inScope() || stripSyntheticForLibraries);
                 // The bytes now declare the RENAMED class; the model must
                 // follow, or every downstream stage (stage0 jar entries,
                 // Stage 1 output paths/stub headers, Stage 3 vendoring)
@@ -108,7 +110,8 @@ public final class BytecodeNormalizer {
                 // the raw instruction stream is usually enough.
                 try {
                     String newName = classRenameMap.getOrDefault(ci.internalName(), ci.internalName());
-                    byte[] normalized = normalizeOne(ci, remapper, typeHierarchy, warnings, true);
+                    byte[] normalized = normalizeOne(ci, remapper, typeHierarchy, warnings, true,
+                            ci.inScope() || stripSyntheticForLibraries);
                     out.add(new ClassInfo(newName, normalized, ci.inScope()));
                     warnings.add(new Warning(ci.internalName(),
                             "recovered by discarding debug info after: " + primaryFailure));
@@ -153,13 +156,30 @@ public final class BytecodeNormalizer {
     }
 
     private byte[] normalizeOne(ClassInfo ci, QualifiedRemapper remapper, Map<String, TypeInfo> typeHierarchy,
-                                 List<Warning> warnings, boolean skipDebug) {
+                                 List<Warning> warnings, boolean skipDebug, boolean stripSynthetic) {
         int readFlags = skipDebug ? ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES
                                    : ClassReader.SKIP_FRAMES;
 
         ClassReader reader = new ClassReader(ci.bytes());
         ClassNode node = new ClassNode();
         reader.accept(node, readFlags);
+
+        if (stripSynthetic) {
+            // Obfuscators set ACC_SYNTHETIC on real classes/members; every
+            // decompiler trusts the flag and silently drops them from its
+            // output (declarations vanish while usages stay -> unresolvable).
+            // The flag carries no verification or dispatch semantics, so
+            // clearing it is behavior-preserving. ACC_BRIDGE is deliberately
+            // kept: bridges ARE duplicates whose removal needs the
+            // override-family analysis, not a flag wipe.
+            node.access &= ~Opcodes.ACC_SYNTHETIC;
+            for (Object fObj : node.fields) {
+                ((org.objectweb.asm.tree.FieldNode) fObj).access &= ~Opcodes.ACC_SYNTHETIC;
+            }
+            for (Object mObj : node.methods) {
+                ((MethodNode) mObj).access &= ~Opcodes.ACC_SYNTHETIC;
+            }
+        }
 
         for (Object mObj : node.methods) {
             MethodNode m = (MethodNode) mObj;

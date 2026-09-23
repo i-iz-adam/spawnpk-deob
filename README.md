@@ -96,6 +96,10 @@ After clearing Stage 4's remaining errors: `gradle build` in
 --release-level 11      javac --release for Stage 4 + Gradle (default 17)
 --main-class rs.Client  write run.bat launching this class
 --jre-home <path>       java used by run.bat (default: PATH)
+--lombok-jar lib/...jar Lombok on Stage 4's javac classpath; Gradle gets
+                        compileOnly + annotationProcessor when sources use it
+--extra-sources stubs/  hand-written .java shims copied into the tree
+                        (e.g. stubs/com/apple/eawt/* for the Mac-only API)
 ```
 
 ## Output layout under `--output`
@@ -116,12 +120,16 @@ out/
 
 ## Known limitations (SpawnPK client)
 
-- Shaded obfuscated trove: `gnu.trove.f/i/e` are both interfaces AND
-  packages, so `import gnu.trove.i.a.i` cannot resolve in source
-  (bytecode is fine). ~70 downstream errors trace to this. Fix options:
-  rename the trove packages, or vendor a canonical trove and remap.
-- `com.apple.eawt` (Mac-only, absent everywhere here): stub or exclude
-  the 2-3 referencing files.
-- `Class961` is bytecode-concrete but misses abstract `apply`:
-  mark it abstract by hand.
+- Out-of-scope types sharing a path with a package (shaded trove's
+  `gnu/trove/f` interface vs `gnu/trove/f/` package, 85 cases) are auto
+  repaired: the type keeps its package and gains a suffix (`f_`), recorded
+  as `library-package-clash` in the manifest. Zero trove errors remain.
+- `com.apple.eawt` (Mac-only, absent everywhere): minimal source shims in
+  `stubs/`, pulled in via `--extra-sources`. Zero eawt errors remain.
+- Lombok-annotated sources: `--lombok-jar` (pinned under `lib/`) for
+  Stage 4 symbols, Gradle processor wiring when used. Zero lombok errors.
+- Remaining ~220 errors are decompiler-precision fallout (method-ref and
+  generics inference, raw-vs-generic override shapes like `method1327`,
+  a few single-site artifacts) -- the manifest lists each; CFR backend or
+  human passes own them.
 - CFR/Procyon backends unwired; Maven fingerprinting stubbed (0 identified).

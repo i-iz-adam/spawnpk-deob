@@ -1,62 +1,71 @@
-# HANDOVER — clean-decompile / SpawnPK deob (2026-09-23)
+# HANDOVER — clean-decompile / SpawnPK deob (2026-09-23, evening)
 
 ## Where things stand
 
-Full pipeline runs end-to-end on `client.jar` (10472 classes, 1129 in
-scope under `--own-package rs`). Latest run (`.\spk_deob.bat`):
-Stage 0: 1102 class/package renames, 12726 field/method renames, 6593 warnings.
-Stage 1: **1128 Vineflower + Client (120s budget) = 0 stubs.**
-Stage 4: loop fires (concat fixer), remainder is input-inherited (below).
+Full pipeline: 10472 classes (1129 in scope), Stage 1 **0 stubs**
+(Vineflower, Client needs 120s budget), Stage 4 loop with per-fixer
+logging + equilibrium stop. Latest: **~221 errors** (peak 320 uncapped;
+the old "11" was partial javac attribution, not truth).
 
-`spk_map.json` mappings verified live in output: `rs.Configuration`
-with `port = 43594`, `Client.sendChatMessage` with real body,
-`Client.eventBus`.
+`spk_map.json` mappings verified live: `rs.Configuration` + `port`,
+`Client.sendChatMessage` (real body), `Client.eventBus`.
 
-## Remaining errors (~100, javac caps display at 100)
+## Resolved this session
 
-| Bucket | Count | Verdict |
-|---|---|---|
-| trove package/interface clashes (`gnu.trove.f/i/e` + fallout `i/cc/bU/k/M` in rs files) | ~70 | Inherited from input jar. Interface and package share a name; javac picks the type, source refs die. Bytecode links fine. Needs trove-package rename or canonical-trove swap (human decision). |
-| `com.apple.eawt[.event]` | 3 | Mac-only API, absent. Stub the 2-3 files or drop them. |
-| `Class961` missing abstract `apply` | 1 | Bytecode-concrete, source-incomplete. Mark abstract by hand. |
-| `lombok` import | 2 | One file references lombok (absent). Check if genuine or Vineflower artifact. |
+- **Trove: ZERO.** `LibraryClashRepair` renames the type side of
+  library type/package clashes (`gnu/trove/f` -> `gnu/trove/f_`,
+  85 cases incl. jackson + top-level `a`), merged into the global
+  remap. Synthetic-jar tested.
+- **Lombok: ZERO.** Pinned `lib/lombok-1.18.32.jar` (committed,
+  gitignore-excepted); `--lombok-jar` on Stage 4's cp (`-proc:none`);
+  Gradle gets compileOnly + annotationProcessor when used.
+- **Applet: ZERO** via `--release-level 11`. **eawt: ZERO** via
+  committed `stubs/com/apple/eawt/*` + generic `--extra-sources`.
+- **Annotation elements** never renamed (string-referenced usages).
+- **Inherited-owner refs**: rename maps propagate to subclasses.
+- **Synthetic flag strip** (in-scope): obfuscator sets ACC_SYNTHETIC
+  on real members; decompilers drop them. Bridge kept.
+- Stage 4 fixers: imports (dup-guarded), concat (multi-line), raw
+  casts (+bogus-strip, anti-stack), artifacts (paren/capture),
+  String compareTo, access widening (private->public), receiver casts
+  (curated JDK map). `-Xmaxerrs 5000`. Loop stops on diagnostic-set
+  equilibrium. Per-fixer counts print each iteration.
 
-`java.applet` errors are GONE since `--release-level 11` (Temurin 11 JRE).
+## Remaining ~221: decompiler-precision fallout
 
-## Decisions made this session (don't re-litigate blindly)
+Top: method-ref inference (~20), Consumer/guava composition,
+raw-vs-generic override shapes (`method1327`), singles
+(`split/exists/mkdir/indexOf/toCharArray` on Object vars,
+`method1240/4551`, `Class1024→Map`, `Object+int`, `String>String`
+leftovers). Next levers, in order:
+1. **Generics restoration from bytecode Signature attributes** into
+   source declarations (fixes refs + conversions + overrides alike).
+2. CFR backend (second opinion; Stage 2 selection exists).
+3. Human passes per `stage4-fix-loop-report.json`.
 
-1. `minKeepableLength=3`: segments/members shorter always renamed; longer + legal kept (`Client`, `cache`, `gui`, `eventBus` survive). All `$` simple names always renamed (top-level stub/source layout can't nest).
-2. Override-poison split: HARD poison (native, serialization, `main`, out-of-scope member) vetoes even custom mappings; heuristic external-touch poison yields to explicit `spk_map.json` entries. Missing JDK ancestors resolve via runtime `Class.forName` check (closed-world for `java.lang.Object`).
-3. `BytecodeNormalizer` propagates renamed names into `ClassInfo` (jar entries, Stage 1 paths, stub headers were stale before).
-4. `VineflowerDecompiler` in-process (`BaseDecompiler` + in-memory source + normalized jar as library + capture sink). Empty options map = defaults (probe-verified). CFR/Procyon still stubs.
-5. `JavacRunner` uses `--release <level>` + vendored jar on classpath. `BuildScaffolder` vendors into `src-generated/libs/`, writes release-aware `build.gradle` + `run.bat` (needs `--main-class`).
-6. `StringConcatFixer` (Stage 4) rewrites Vineflower's leaked `StringConcatFactory.makeConcatWithConstants<...>` to `+` chains. Conservative skip on shape mismatch.
-7. Deps default = vendored bytecode jars (`--decompile-libraries` opt-in for full lib sources; never full-run on client.jar — 30-60 min and trove sources won't compile).
-8. New files: `spk_deob.bat`, `spk_map.json` (gitignored), `spk_map.example.json` (committed).
+## What's next
 
-## What's next (priority order)
-
-1. Trove strategy (blocks compilation): rename trove packages in vendoring, or swap canonical trove + remap refs. Biggest single win (~70 errors).
-2. eawt/lombok/Class961 hand-fixes (5 min each, listed above).
-3. `gradle build` in `out\src-generated`, then `run.bat` (Temurin 11) — first real launch attempt.
-4. Grow `spk_map.json` from `stage0-rename-manifest.json` (`global-unique-name` entries = unnamed).
-5. Wire CFR backend (second opinion for Vineflower timeouts/failures).
-6. `--decompile-libraries` full-run validation on client.jar (only synthetic-tested).
-7. Maven fingerprinting (currently 0 identified, no network in sandbox).
+1. Generics restoration or CFR.
+2. `gradle build` in `out\src-generated` after human fixes; `run.bat`.
+3. Grow `spk_map.json` from manifest (`global-unique-name` = unnamed).
+4. `--decompile-libraries` full-run validation on client.jar (synthetic
+   only). Maven fingerprinting still stubbed.
 
 ## Commands
 
 ```
-.\spk_deob.bat                                   # full SpawnPK run
-& "...\corretto-26.0.1\bin\java.exe" -jar target\clean-decompile.jar --help
+.\spk_deob.bat                                   # full run (~5 min)
 rtk mvn -q -DskipTests package                   # rebuild
 ```
 
-Repo: `i-iz-adam/spawnpk-deob` (public). `out/`, `target/`, `*.jar`, real mappings gitignored.
+Repo: `i-iz-adam/spawnpk-deob` (public). `out/`, `target/`, `*.jar`
+(except `lib/lombok-*`), real mappings gitignored.
 
-## Gotchas for the next session
+## Gotchas
 
-- `out/` is wiped per run design (Stage 1 cleans its tree); always full reruns (~5 min, Client needs the 120s timeout).
-- Never transmit `\uXXXX` escapes through the Edit tool (mojibake); use `Character.toString((char) N)` or raw chars.
-- `ctx_*` sandbox tools run bash, not PowerShell — use `default.bash` for PS commands.
-- Stage 4 report truncates at javac's 100-error cap; composition shifts as syntax errors clear.
+- Never transmit `\uXXXX` escapes through Edit (mojibake); use
+  `(char) N` or raw chars; hex-dump on mismatch.
+- `ctx_*` sandbox tools run bash, not PowerShell.
+- javac caps at 100 errors by default; loop equilibrium > counts.
+- Fixers must be idempotent, non-stacking, and count real writes.
+- A "too good" rerun (11 vs 273) means partial attribution, not truth.

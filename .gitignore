@@ -8,6 +8,8 @@ dependency-reduced-pom.xml
 
 # input jars (private / large - place client.jar next to spk_deob.bat, never commit)
 *.jar
+# ...except the pinned build-time lombok jar used for decompiled sources
+!lib/lombok-*.jar
 
 # real name mappings (private knowledge - copy spk_map.example.json to start)
 spk_map.json

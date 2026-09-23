@@ -56,6 +56,16 @@ public final class Main implements Callable<Integer> {
             + "launches with. Omit to use plain java from PATH.")
     String jreHome = "";
 
+    @Option(names = {"--lombok-jar"}, description = "Path to a Lombok jar, added to Stage 4's javac classpath "
+            + "so decompiled sources using lombok annotations (e.g. @NonNull) resolve. The generated Gradle "
+            + "build declares Lombok from Maven Central when any source imports it. Omit if unused.")
+    Path lombokJar;
+
+    @Option(names = {"--extra-sources"}, description = "Directory of hand-written .java shims copied into the "
+            + "generated source tree (relative paths preserved), e.g. stubs for platform APIs absent from "
+            + "both the jar and the JDK. Omit if unused.")
+    Path extraSources;
+
     public static void main(String[] args) {
         int exitCode = new CommandLine(new Main()).execute(args);
         System.exit(exitCode);
@@ -65,7 +75,7 @@ public final class Main implements Callable<Integer> {
     public Integer call() throws Exception {
         PipelineConfig config = new PipelineConfig(
                 inputJar, outputDir, ownPackages, decompileTimeoutMs, maxFixIterations, customNamesFile,
-                decompileLibraries, releaseLevel, mainClass, jreHome);
+                decompileLibraries, releaseLevel, mainClass, jreHome, lombokJar, extraSources);
         new PipelineOrchestrator().runFull(config);
         return 0;
     }

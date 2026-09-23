@@ -30,22 +30,31 @@ final class RawClassHeader {
     final String superName; // null only for java/lang/Object itself
     final List<String> interfaces;
     final boolean isInterface;
+    final boolean isAnnotation;
     final boolean inScope;
     final List<Member> methods = new ArrayList<>();
     final List<Member> fields = new ArrayList<>();
 
     private RawClassHeader(String internalName, String superName, List<String> interfaces,
-                            boolean isInterface, boolean inScope) {
+                            boolean isInterface, boolean isAnnotation, boolean inScope) {
         this.internalName = internalName;
         this.superName = superName;
         this.interfaces = interfaces;
         this.isInterface = isInterface;
+        this.isAnnotation = isAnnotation;
         this.inScope = inScope;
     }
 
     boolean declaresMethod(String name, String descriptor) {
         for (Member m : methods) {
             if (m.name().equals(name) && m.descriptor().equals(descriptor)) return true;
+        }
+        return false;
+    }
+
+    boolean declaresField(String name, String descriptor) {
+        for (Member f : fields) {
+            if (f.name().equals(name) && f.descriptor().equals(descriptor)) return true;
         }
         return false;
     }
@@ -73,7 +82,8 @@ final class RawClassHeader {
                                    String superName, String[] interfaces) {
                     holder[0] = new RawClassHeader(name, superName,
                             interfaces == null ? List.of() : List.of(interfaces),
-                            (access & Opcodes.ACC_INTERFACE) != 0, ci.inScope());
+                            (access & Opcodes.ACC_INTERFACE) != 0,
+                            (access & Opcodes.ACC_ANNOTATION) != 0, ci.inScope());
                 }
 
                 @Override

@@ -51,6 +51,13 @@ import java.util.List;
  * @param jreHome       JDK/JRE home whose {@code bin/java} the generated
  *                        run script launches with. Empty (default) means
  *                        plain {@code java} from PATH.
+ * @param lombokJar     optional path to a Lombok jar for Stage 4's javac
+ *                        classpath (decompiled sources may use Lombok
+ *                        annotations). Null if not given.
+ * @param extraSources  optional directory of hand-written .java shims to
+ *                        copy into the generated source tree (e.g. stubs
+ *                        for platform APIs in neither the jar nor the JDK).
+ *                        Null if not given.
  */
 public record PipelineConfig(
         Path inputJar,
@@ -62,7 +69,9 @@ public record PipelineConfig(
         boolean decompileLibraries,
         String releaseLevel,
         String mainClass,
-        String jreHome
+        String jreHome,
+        Path lombokJar,
+        Path extraSources
 ) {
     public static final long DEFAULT_TIMEOUT_MS = 15_000L;
     public static final int DEFAULT_MAX_FIX_ITERATIONS = 8;

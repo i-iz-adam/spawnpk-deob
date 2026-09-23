@@ -56,6 +56,11 @@ public record MemberRenameEntry(
     public static final String REASON_CUSTOM_OVERRIDE_IGNORED = "custom-override-ignored-hard-protected";
     /** The custom-names file explicitly listed this member to keep. */
     public static final String REASON_CUSTOM_KEEP = "custom-override-keep";
+    /** Declared by an annotation type: element names are referenced by
+     *  string in every usage site's bytecode (not symbolic refs the
+     *  remapper could rewrite), so renaming one breaks all of them.
+     *  Never renamed, not even via a custom override. */
+    public static final String REASON_ANNOTATION_ELEMENT = "annotation-element-not-renamed";
     /** Name is already at/above minKeepableLength and source-legal, so it
      *  looks genuine (e.g. Client, eventBus) rather than obfuscator junk
      *  (a, b, x1) -- left alone by default. */
