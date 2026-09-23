@@ -1,0 +1,20 @@
+{
+  "packages": {},
+  "classes": {
+    "rs.f.a": "rs.Configuration"
+  },
+  "fields": {
+    "rs.f.a#b:Ljava/lang/Integer;": "port",
+    "rs.Client#p": "eventBus"
+  },
+  "methods": {
+    "rs.Client#a(Ljava/lang/String;ILjava/lang/String;)V": "sendChatMessage"
+  },
+  "keepFields": [],
+  "keepMethods": [],
+  "fieldPrefix": "field",
+  "methodPrefix": "method",
+  "classPrefix": "Class",
+  "packagePrefix": "pkg",
+  "minKeepableLength": 3
+}

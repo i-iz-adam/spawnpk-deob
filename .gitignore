@@ -1,0 +1,27 @@
+# pipeline output (regenerated every run)
+/out/
+
+# build output
+/target/
+dependency-reduced-pom.xml
+*.class
+
+# input jars (private / large - place client.jar next to spk_deob.bat, never commit)
+*.jar
+
+# real name mappings (private knowledge - copy spk_map.example.json to start)
+spk_map.json
+*map*.json
+!spk_map.example.json
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
