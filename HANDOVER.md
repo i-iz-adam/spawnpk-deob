@@ -38,14 +38,27 @@ raw-vs-generic override shapes (`method1327`), singles
 (`split/exists/mkdir/indexOf/toCharArray` on Object vars,
 `method1240/4551`, `Class1024→Map`, `Object+int`, `String>String`
 leftovers). Next levers, in order:
-1. **Generics restoration from bytecode Signature attributes** into
-   source declarations (fixes refs + conversions + overrides alike).
-2. CFR backend (second opinion; Stage 2 selection exists).
-3. Human passes per `stage4-fix-loop-report.json`.
+1. **CFR backend** (second opinion; Stage 2 selection exists).
+   Evidence 2026-09-23: the method-ref failures are Vineflower
+   lambda mis-reductions, NOT missing generics — e.g. Class991
+   `anyMatch(Class991::method2029)` where method2029 takes
+   `(double, double, Shape)` (capturing-lambda collapsed to a bad
+   static ref). Class generics (`<T extends Shape>`) survive fine,
+   so bytecode-Signature restoration is NOT the lever. CFR renders
+   invokedynamic/lambdas independently — likely nails these ~20.
+   CFR probe DONE (subagent, 2026-09-23): `CfrDriver.Builder`
+   + custom `ClassFileSource` (bytes via provider) + `OutputSinkFactory`
+   capturing `SinkReturns.Decompiled.getJava()`; `withOptions(Map.of())`
+   = defaults; fresh driver per call (stateless, timeout-safe).
+   NOTE: wiring CFR as fallback alone changes nothing (Vineflower
+   succeeds everywhere) — must ALSO rewire Stage 1 to run all backends
+   per class and let OutputSelector pick (now single-backend-wins).
+   That doubles stage-1 time (~10 min/run).
+2. Human passes per `stage4-fix-loop-report.json`.
 
 ## What's next
 
-1. Generics restoration or CFR.
+1. CFR backend + Stage 1 multi-backend selection (probe above).
 2. `gradle build` in `out\src-generated` after human fixes; `run.bat`.
 3. Grow `spk_map.json` from manifest (`global-unique-name` = unnamed).
 4. `--decompile-libraries` full-run validation on client.jar (synthetic
