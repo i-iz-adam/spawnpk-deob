@@ -12,6 +12,20 @@ the old "11" was partial javac attribution, not truth).
 
 ## Resolved this session
 
+- **CFR backend wired** (`CfrDecompiler`: `CfrDriver.Builder` +
+  in-memory `ClassFileSource` + capture sink; MULTIVER sink, not
+  DECOMPILED). JDK platform classes served from `jrt:/` (`JdkClasses`)
+  so CFR stops degrading to Object. Stage 1 runs all backends per
+  class, `OutputSelector` picks (residue/Object/method-ref-arity
+  signals, all unit-tested incl. fixture regression test).
+- **Swap rounds** (orchestrator): failing files retried with untried
+  backends, kept only on strict whole-tree improvement, else reverted
+  (bounded 2 rounds, equilibrium stop, per-fixer logging). Honest
+  negative on SPK: 68 files retried, all reverted — alternates don't
+  beat first picks here. Mechanism stays for Procyon/other jars.
+- Trove/applet/lombok/eawt: all zero (clash repair, release 11,
+  lombok jar, eawt shims).
+
 - **Trove: ZERO.** `LibraryClashRepair` renames the type side of
   library type/package clashes (`gnu/trove/f` -> `gnu/trove/f_`,
   85 cases incl. jackson + top-level `a`), merged into the global
@@ -31,34 +45,23 @@ the old "11" was partial javac attribution, not truth).
   (curated JDK map). `-Xmaxerrs 5000`. Loop stops on diagnostic-set
   equilibrium. Per-fixer counts print each iteration.
 
-## Remaining ~221: decompiler-precision fallout
+## Remaining ~280: decompiler-precision fallout (CFR wins 50 files,
+37 clean; its 13 dirty ones carry ~155, Client dominant)
 
 Top: method-ref inference (~20), Consumer/guava composition,
 raw-vs-generic override shapes (`method1327`), singles
 (`split/exists/mkdir/indexOf/toCharArray` on Object vars,
 `method1240/4551`, `Class1024→Map`, `Object+int`, `String>String`
 leftovers). Next levers, in order:
-1. **CFR backend** (second opinion; Stage 2 selection exists).
-   Evidence 2026-09-23: the method-ref failures are Vineflower
-   lambda mis-reductions, NOT missing generics — e.g. Class991
-   `anyMatch(Class991::method2029)` where method2029 takes
-   `(double, double, Shape)` (capturing-lambda collapsed to a bad
-   static ref). Class generics (`<T extends Shape>`) survive fine,
-   so bytecode-Signature restoration is NOT the lever. CFR renders
-   invokedynamic/lambdas independently — likely nails these ~20.
-   CFR probe DONE (subagent, 2026-09-23): `CfrDriver.Builder`
-   + custom `ClassFileSource` (bytes via provider) + `OutputSinkFactory`
-   capturing `SinkReturns.Decompiled.getJava()`; `withOptions(Map.of())`
-   = defaults; fresh driver per call (stateless, timeout-safe).
-   NOTE: wiring CFR as fallback alone changes nothing (Vineflower
-   succeeds everywhere) — must ALSO rewire Stage 1 to run all backends
-   per class and let OutputSelector pick (now single-backend-wins).
-   That doubles stage-1 time (~10 min/run).
+1. Procyon backend (third opinion; swap machinery already handles it).
 2. Human passes per `stage4-fix-loop-report.json`.
+(Ruled out: bytecode-Signature restoration -- method-ref failures are
+Vineflower lambda mis-reductions, e.g. Class991 collapsing a capturing
+lambda into wrong-arity static refs; class generics survive fine.)
 
 ## What's next
 
-1. CFR backend + Stage 1 multi-backend selection (probe above).
+1. Procyon backend (swap machinery handles new backends automatically).
 2. `gradle build` in `out\src-generated` after human fixes; `run.bat`.
 3. Grow `spk_map.json` from manifest (`global-unique-name` = unnamed).
 4. `--decompile-libraries` full-run validation on client.jar (synthetic

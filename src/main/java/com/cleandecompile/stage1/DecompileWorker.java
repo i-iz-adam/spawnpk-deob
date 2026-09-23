@@ -45,35 +45,40 @@ public final class DecompileWorker {
         });
     }
 
-    public DecompileResult decompile(String internalName, byte[] classBytes,
-                                      Function<String, byte[]> classBytesProvider) {
-        List<DecompileResult.AttemptLogEntry> log = new ArrayList<>();
+    /** One backend's output for a class: null source means it failed,
+     *  timed out, or produced nothing usable (see its log entry). */
+    public record BackendOutput(String decompilerName, String source,
+                                DecompileResult.AttemptLogEntry logEntry) {
+    }
+
+    public List<BackendOutput> decompileAll(String internalName, byte[] classBytes,
+                                            Function<String, byte[]> classBytesProvider) {
+        List<BackendOutput> outputs = new ArrayList<>();
         long timeoutMs = adaptiveTimeout(classBytes.length);
 
         for (Decompiler decompiler : decompilersInPriorityOrder) {
             Future<String> future = pool.submit(() -> decompiler.decompile(internalName, classBytesProvider));
             try {
                 String source = future.get(timeoutMs, TimeUnit.MILLISECONDS);
-                log.add(new DecompileResult.AttemptLogEntry(
-                        decompiler.name(), DecompileResult.Outcome.SUCCESS, null));
-                return new DecompileResult(internalName, source, decompiler.name(), false, log);
+                if (source == null || source.isBlank()) {
+                    throw new IllegalStateException(decompiler.name() + " returned empty output");
+                }
+                outputs.add(new BackendOutput(decompiler.name(), source,
+                        new DecompileResult.AttemptLogEntry(
+                                decompiler.name(), DecompileResult.Outcome.SUCCESS, null)));
             } catch (TimeoutException te) {
                 future.cancel(true);
-                log.add(new DecompileResult.AttemptLogEntry(
-                        decompiler.name(), DecompileResult.Outcome.TIMED_OUT, timeoutMs + "ms"));
+                outputs.add(new BackendOutput(decompiler.name(), null,
+                        new DecompileResult.AttemptLogEntry(
+                                decompiler.name(), DecompileResult.Outcome.TIMED_OUT, timeoutMs + "ms")));
             } catch (Exception e) {
                 Throwable cause = e.getCause() != null ? e.getCause() : e;
-                log.add(new DecompileResult.AttemptLogEntry(
-                        decompiler.name(), DecompileResult.Outcome.FAILED, String.valueOf(cause)));
+                outputs.add(new BackendOutput(decompiler.name(), null,
+                        new DecompileResult.AttemptLogEntry(
+                                decompiler.name(), DecompileResult.Outcome.FAILED, String.valueOf(cause))));
             }
         }
-
-        // Every backend failed -- fall back to a bytecode-recovered stub so
-        // the tree still compiles, with the real method bodies preserved
-        // as a Textifier dump for a human (or a future decompiler run) to
-        // work from.
-        String stub = StubGenerator.generate(internalName, classBytes, classBytesProvider);
-        return new DecompileResult(internalName, stub, "stub", true, log);
+        return outputs;
     }
 
     public void shutdown() {

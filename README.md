@@ -14,10 +14,10 @@ scaffolding + vendored libs -> Stage 4 javac compile-fix loop.
 | Stage | State |
 |---|---|
 | 0 — Bytecode normalization | Implemented. Scope-aware renames (classes, packages, fields, methods), override-safe method families, `minKeepableLength` keep heuristic (short junk renamed, long genuine names kept), custom-name overrides, frame repair. |
-| 1 — Multi-decompiler harness | **Vineflower wired (in-process, per-class timeout, full-jar library context).** CFR/Procyon backends still stubs. Unwired/failed classes fall back to bytecode stubs. |
-| 2 — Output selection | Single-backend-wins; scoring heuristic + formatting pass implemented, multi-backend wiring TODO. |
+| 1 — Multi-decompiler harness | **Vineflower + CFR wired (in-process, per-class timeouts, full-jar + JDK library context).** Procyon backend still a stub. Every backend runs per class; `--decompile-libraries` unaffected. |
+| 2 — Output selection | Heuristic pick (raw/synthetic/residue/Object/method-ref-arity signals) plus **swap rounds**: failing files are retried with untried backends and the swap is kept only if whole-tree errors strictly drop (reverts otherwise). Formatting pass still TODO. |
 | 3 — Resource & build scaffolding | Implemented. Libraries vendored into `src-generated/libs/`, Gradle build at release level, `run.bat` when `--main-class` given. Dependency fingerprinting against Maven Central is a stub. |
-| 4 — Compile-fix loop | Real javac loop with import insertion + string-concat bootstrap rewrite. Bridge-method removal and raw-type casts are TODOs. |
+| 4 — Compile-fix loop | Real javac loop: import insertion, string-concat/bootstrap rewrite, raw casts, decompiler artifacts, String compareTo, access widening, receiver casts. Equilibrium stop, per-fixer logging. Bridge-method removal still TODO. |
 
 ## Building
 

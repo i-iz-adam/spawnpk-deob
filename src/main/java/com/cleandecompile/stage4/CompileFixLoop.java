@@ -30,7 +30,9 @@ public final class CompileFixLoop {
     public record IterationSummary(int iteration, int errorCountBefore, int errorCountAfter, int autoFixesApplied) {}
 
     public record LoopReport(boolean converged, List<IterationSummary> iterations,
-                              List<String> remainingErrorSummaries) {}
+                             List<String> remainingErrorSummaries,
+                             List<String> failingFiles) {
+    }
 
     public LoopReport run(PipelineConfig config) throws IOException {
         Path sourceRoot = config.decompiledSourcesDir();
@@ -52,7 +54,7 @@ public final class CompileFixLoop {
                     config.releaseLevel());
             if (outcome.success()) {
                 iterations.add(new IterationSummary(i, 0, 0, 0));
-                LoopReport report = new LoopReport(true, iterations, List.of());
+                LoopReport report = new LoopReport(true, iterations, List.of(), List.of());
                 writeReport(config, report);
                 return report;
             }
@@ -72,7 +74,8 @@ public final class CompileFixLoop {
             }
             if (signatures.equals(previousSignatures)) {
                 iterations.add(new IterationSummary(i, errorsBefore, errorsBefore, 0));
-                LoopReport report = new LoopReport(false, iterations, summarize(outcome.diagnostics()));
+                LoopReport report = new LoopReport(false, iterations, summarize(outcome.diagnostics()),
+                        failingFiles(sourceRoot, outcome.diagnostics()));
                 writeReport(config, report);
                 return report;
             }
@@ -85,11 +88,12 @@ public final class CompileFixLoop {
             if (fixesApplied == 0) {
                 // Nothing left we know how to fix mechanically -- report the
                 // remainder for a human. Error counts are NOT compared
-                // across iterations: fixing a file's syntax routinely
-                // reveals dozens of deeper attribution errors, so a rising
-                // count is progress, not regress.
+                // across iterations: fixing syntax routinely reveals deeper
+                // attribution errors, so a rising count is progress, not
+                // regress.
                 List<String> remaining = summarize(outcome.diagnostics());
-                LoopReport report = new LoopReport(false, iterations, remaining);
+                LoopReport report = new LoopReport(false, iterations, remaining,
+                        failingFiles(sourceRoot, outcome.diagnostics()));
                 writeReport(config, report);
                 return report;
             }
@@ -97,9 +101,35 @@ public final class CompileFixLoop {
 
         JavacRunner.CompileOutcome finalOutcome = javac.compile(sourceRoot, classOutput, classpath,
                 config.releaseLevel());
-        LoopReport report = new LoopReport(finalOutcome.success(), iterations, summarize(finalOutcome.diagnostics()));
+        LoopReport report = new LoopReport(finalOutcome.success(), iterations,
+                summarize(finalOutcome.diagnostics()),
+                failingFiles(sourceRoot, finalOutcome.diagnostics()));
         writeReport(config, report);
         return report;
+    }
+
+    /** Distinct slash-form internal names with at least one error, derived
+     *  from diagnostic source paths (extra-source shims included -- callers
+     *  filter to decompilable classes themselves). */
+    private List<String> failingFiles(Path sourceRoot, List<Diagnostic<? extends JavaFileObject>> diagnostics) {
+        // Diagnostic paths are absolute while configured roots may be
+        // relative -- absolutize before comparing, or nothing ever matches.
+        Path root = sourceRoot.toAbsolutePath().normalize();
+        Set<String> files = new java.util.LinkedHashSet<>();
+        for (var d : diagnostics) {
+            if (d.getSource() == null) continue;
+            try {
+                Path file = Path.of(d.getSource().toUri()).toAbsolutePath().normalize();
+                if (!file.startsWith(root)) continue;
+                String rel = root.relativize(file).toString();
+                if (!rel.endsWith(".java")) continue;
+                files.add(rel.substring(0, rel.length() - ".java".length()).replace(
+                        file.getFileSystem().getSeparator(), "/"));
+            } catch (Exception ignored) {
+                // Unresolvable source -- not attributable to a file.
+            }
+        }
+        return new ArrayList<>(files);
     }
 
     private int applyMechanicalFixes(Path sourceRoot, List<DiagnosticBucketer.Bucketed> bucketed) throws IOException {
@@ -606,6 +636,11 @@ public final class CompileFixLoop {
                 Pattern.compile("\\(([\\w.$]+)\\)\\)\\s*\\(\\1\\)\\s*(?=new\\b)");
         private static final Pattern CAPTURE_CAST =
                 Pattern.compile("\\(capture#\\d+ of [^()]*\\)\\s*");
+        // CFR marks uninferred void temporaries with a WARNING comment and
+        // emits them as `void var;`, which is never legal Java. The variable
+        // is unused by construction (nothing can read void), so drop it.
+        private static final Pattern VOID_VARIABLE =
+                Pattern.compile("^\\s*void\\s+[A-Za-z_]\\w*\\s*;\\s*$");
 
         static int tryFixAll(Path sourceRoot) throws IOException {
             int fixed = 0;
@@ -615,6 +650,12 @@ public final class CompileFixLoop {
                     boolean changed = false;
                     for (int i = 0; i < lines.size(); i++) {
                         String line = lines.get(i);
+                        if (VOID_VARIABLE.matcher(line).matches()) {
+                            lines.set(i, "");
+                            changed = true;
+                            fixed++;
+                            continue;
+                        }
                         String rewritten = DOUBLE_PAREN_NEW.matcher(line).replaceAll("($1)$2new");
                         rewritten = DOUBLED_CAST_BEFORE_NEW.matcher(rewritten).replaceAll("");
                         rewritten = CAPTURE_CAST.matcher(rewritten).replaceAll("");
