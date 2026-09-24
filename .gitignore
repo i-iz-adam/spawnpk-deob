@@ -1,5 +1,6 @@
 # pipeline output (regenerated every run)
 /out/
+src.zip
 
 # build output
 /target/
