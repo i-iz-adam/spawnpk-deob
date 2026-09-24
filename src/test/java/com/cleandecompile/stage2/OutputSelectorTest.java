@@ -13,6 +13,12 @@ import org.junit.jupiter.api.Test;
  * Vineflower collapses capturing lambdas into wrong-arity static refs
  * ({@code anyMatch(Class991::method2029)}) and CFR renders them correctly
  * ({@code anyMatch(arg -> Class991.method2029(d, d2, arg))}).
+ *
+ * <p>The Vineflower fixture contains eight such refs: six {@code anyMatch}
+ * predicates (3-, 5- and 2-arg statics where the SAM takes one argument) and
+ * two {@code map(Class991::method91 / method4424)} in
+ * {@code getPathIterator} (2- and 3-arg statics, likewise collapsed from
+ * {@code arg -> Class991.method91(affineTransform, arg)}).
  */
 class OutputSelectorTest {
 
@@ -27,7 +33,8 @@ class OutputSelectorTest {
         int vineflowerBadRefs = OutputSelector.MethodRefCheck.mismatchedCount(vineflower);
         int cfrBadRefs = OutputSelector.MethodRefCheck.mismatchedCount(cfr);
         System.out.println("badRefs vineflower=" + vineflowerBadRefs + " cfr=" + cfrBadRefs);
-        assertEquals(6, vineflowerBadRefs, "expected all six collapsed refs flagged");
+        assertEquals(8, vineflowerBadRefs,
+                "expected all eight collapsed refs flagged (six anyMatch + two map)");
         assertEquals(0, cfrBadRefs);
         var best = new OutputSelector().pickBest(Map.of("vineflower", vineflower, "cfr", cfr));
         assertEquals("cfr", best.decompilerName());

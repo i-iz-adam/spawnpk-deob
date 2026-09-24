@@ -81,7 +81,7 @@ public final class CompileFixLoop {
             }
             previousSignatures = signatures;
 
-            int fixesApplied = applyMechanicalFixes(sourceRoot, bucketed);
+            int fixesApplied = applyMechanicalFixes(sourceRoot, bucketed, classpath, config.releaseLevel());
 
             iterations.add(new IterationSummary(i, errorsBefore, -1 /* filled in next loop */, fixesApplied));
 
@@ -132,9 +132,24 @@ public final class CompileFixLoop {
         return new ArrayList<>(files);
     }
 
-    private int applyMechanicalFixes(Path sourceRoot, List<DiagnosticBucketer.Bucketed> bucketed) throws IOException {
-        Map<DiagnosticBucketer.Category, List<DiagnosticBucketer.Bucketed>> grouped = bucketer.group(bucketed);
+    private int applyMechanicalFixes(Path sourceRoot, List<DiagnosticBucketer.Bucketed> bucketed,
+                                     List<Path> classpath, String releaseLevel) throws IOException {
         int fixes = 0;
+
+        // Decompilers type a local as Object when the verifier merged its
+        // interface/slot-reused types, then use it as an array, iterable or
+        // receiver. Runs FIRST: it works from the diagnostics' line numbers
+        // and the type oracle needs the files exactly as javac saw them
+        // (ImportInserter below shifts lines). Diagnostics it handled are
+        // withheld from the later line-scoped fixers, which would otherwise
+        // stack redundant casts on the very same lines.
+        ObjectTypedLocalFixer.Result objectFix =
+                ObjectTypedLocalFixer.tryFixAll(sourceRoot, bucketed, classpath, releaseLevel);
+        int objectFixes = objectFix.fixes();
+        fixes += objectFixes;
+        bucketed = objectFix.unhandled(bucketed);
+
+        Map<DiagnosticBucketer.Category, List<DiagnosticBucketer.Bucketed>> grouped = bucketer.group(bucketed);
 
         var unresolved = grouped.getOrDefault(DiagnosticBucketer.Category.UNRESOLVED_SYMBOL, List.of());
         int importFixes = 0;
@@ -181,8 +196,8 @@ public final class CompileFixLoop {
         fixes += receiverFixes;
 
         if (fixes > 0) {
-            System.out.printf("  fixes applied: imports=%d concat=%d casts=%d artifacts=%d compare=%d widen=%d receiver=%d%n",
-                    importFixes, concatFixes, castFixes, artifactFixes, compareFixes, widenFixes, receiverFixes);
+            System.out.printf("  fixes applied: objectTyped=%d imports=%d concat=%d casts=%d artifacts=%d compare=%d widen=%d receiver=%d%n",
+                    objectFixes, importFixes, concatFixes, castFixes, artifactFixes, compareFixes, widenFixes, receiverFixes);
         }
 
         // TODO: DUPLICATE_METHOD -- remove the redundant bridge method
