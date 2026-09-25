@@ -95,7 +95,22 @@ public final class BuildScaffolder {
         sb.append("}\n\n");
         sb.append("java {\n    sourceCompatibility = JavaVersion.").append(javaVersionLiteral(config.releaseLevel()))
                 .append("\n    targetCompatibility = JavaVersion.").append(javaVersionLiteral(config.releaseLevel()))
-                .append("\n}\n");
+                .append("\n}\n\n");
+        // Mirror Stage 4's compile settings or the two disagree about the
+        // error set: --release (not just source/target) selects the platform
+        // classes, and the default 100-error cap hides the true count that
+        // the fix loop reports uncapped (-Xmaxerrs 5000).
+        sb.append("tasks.withType(JavaCompile).configureEach {\n");
+        sb.append("    // --release, not just source/target compatibility: selects the\n");
+        sb.append("    // platform classes Stage 4 compiles against.\n");
+        try {
+            int release = Integer.parseInt(config.releaseLevel());
+            sb.append("    options.release = ").append(release).append("\n");
+        } catch (NumberFormatException nfe) {
+            // Non-numeric level -- the java{} compatibility above still applies.
+        }
+        sb.append("    options.compilerArgs += ['-Xmaxerrs', '5000']\n");
+        sb.append("}\n");
 
         Files.createDirectories(config.projectDir());
         Files.writeString(config.projectDir().resolve("build.gradle"), sb.toString());
