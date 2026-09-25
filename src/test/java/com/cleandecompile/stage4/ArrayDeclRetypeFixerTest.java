@@ -113,4 +113,69 @@ class ArrayDeclRetypeFixerTest {
 
         assertEquals(0, result.fixes());
     }
+
+    @Test
+    void ignoresMethodHeadersAndDeclarationsInsideBlockComments(@TempDir Path root) throws IOException {
+        write(root, "rs/F.java", """
+                package rs;
+
+                public class F {
+                    void m(String string) {
+                        /*
+                        String[] stringArray = null;
+                        */
+                        String[] stringArray;
+                        /*
+                        void method1234() {
+                        */
+                        stringArray = string.toLowerCase();
+                        if (stringArray.startsWith("::x")) {
+                            System.out.println(stringArray.replace("::x", ""));
+                        }
+                    }
+                }
+                """);
+
+        var outcome = javac.compile(root, root.resolveSibling("classes"), List.of(), "17");
+        assertTrue(outcome.diagnostics().size() >= 2, "expected cluster of String/String[] errors");
+
+        var result = CompileFixLoop.ArrayDeclRetypeFixer.tryFixAll(
+                root, bucketer.categorize(outcome.diagnostics()));
+
+        assertEquals(1, result.fixes(),
+                "comment text is not code: a commented header or declaration must not steer the scans");
+        var after = javac.compile(root, root.resolveSibling("classes2"), List.of(), "17");
+        assertTrue(after.success(), "expected clean compile after retype");
+    }
+
+    @Test
+    void braceMatchingIgnoresBracesInsideBlockComments(@TempDir Path root) throws IOException {
+        write(root, "rs/E.java", """
+                package rs;
+
+                public class E {
+                    void m(String string, int other) {
+                        String[] stringArray;
+                        stringArray = string.toLowerCase();
+                        /* } } } the method continues past this comment,
+                           and it opens an if down there: { */
+                        int n = stringArray.length;
+                        if (stringArray[0].isEmpty()) {
+                            System.out.println(n);
+                        }
+                    }
+                }
+                """);
+        String before = Files.readString(root.resolve("rs/E.java"));
+
+        var outcome = javac.compile(root, root.resolveSibling("classes"), List.of(), "17");
+        assertTrue(outcome.diagnostics().size() >= 1, "expected a String/String[] mismatch");
+
+        var result = CompileFixLoop.ArrayDeclRetypeFixer.tryFixAll(
+                root, bucketer.categorize(outcome.diagnostics()));
+
+        assertEquals(0, result.fixes(),
+                "a brace inside a block comment must not truncate the method range");
+        assertEquals(before, Files.readString(root.resolve("rs/E.java")));
+    }
 }

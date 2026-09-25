@@ -62,6 +62,41 @@ class VarSplitFixerTest {
     }
 
     @Test
+    void ignoresMethodHeadersAndCommentTextWhenSplitting(@TempDir Path root) throws IOException {
+        write(root, "rs/C.java", """
+                package rs;
+
+                public class C {
+                    void m(String string) {
+                        String[] stringArray;
+                        /*
+                        void method1234() {
+                        */
+                        stringArray = (String[]) string.toLowerCase();
+                        /* the fresh name must be stringArrayStr */
+                        if (stringArray.startsWith("::x")) {
+                            System.out.println(stringArray.replace("::x", ""));
+                        }
+                    }
+                }
+                """);
+
+        var outcome = javac.compile(root, root.resolveSibling("classes"), List.of(), "17");
+        assertTrue(outcome.diagnostics().size() >= 2, "expected String/String[] cluster");
+
+        var result = CompileFixLoop.VarSplitFixer.tryFixAll(
+                root, bucketer.categorize(outcome.diagnostics()));
+
+        assertEquals(1, result.fixes(),
+                "comment text is not code: a commented header or name must not steer the scans");
+        String updated = Files.readString(root.resolve("rs/C.java"));
+        assertTrue(updated.contains("String stringArrayStr = string.toLowerCase();"),
+                "the comment must not steal the plain fresh name:\n" + updated);
+        var after = javac.compile(root, root.resolveSibling("classes2"), List.of(), "17");
+        assertTrue(after.success(), "expected clean compile after split");
+    }
+
+    @Test
     void leavesGenuineArraysAlone(@TempDir Path root) throws IOException {
         write(root, "rs/B.java", """
                 package rs;
