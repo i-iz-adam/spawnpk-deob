@@ -27,7 +27,8 @@ public final class CompileFixLoop {
 
     private final DiagnosticBucketer bucketer = new DiagnosticBucketer();
 
-    public record IterationSummary(int iteration, int errorCountBefore, int errorCountAfter, int autoFixesApplied) {}
+    public record IterationSummary(int iteration, int errorCountBefore, int errorCountAfter, int autoFixesApplied,
+                                   int revertedFileCount) {}
 
     public record LoopReport(boolean converged, List<IterationSummary> iterations,
                              List<String> remainingErrorSummaries,
@@ -49,11 +50,15 @@ public final class CompileFixLoop {
         List<IterationSummary> iterations = new ArrayList<>();
         Set<String> previousSignatures = null;
 
+        // Compiled once up front; each subsequent iteration reuses the
+        // recompile that applyFixesTransactionally already did to evaluate
+        // its own fixes (see there), rather than compiling twice per loop.
+        JavacRunner.CompileOutcome outcome = javac.compile(sourceRoot, classOutput, classpath,
+                config.releaseLevel());
+
         for (int i = 1; i <= config.maxFixLoopIterations(); i++) {
-            JavacRunner.CompileOutcome outcome = javac.compile(sourceRoot, classOutput, classpath,
-                    config.releaseLevel());
             if (outcome.success()) {
-                iterations.add(new IterationSummary(i, 0, 0, 0));
+                iterations.add(new IterationSummary(i, 0, 0, 0, 0));
                 LoopReport report = new LoopReport(true, iterations, List.of(), List.of());
                 writeReport(config, report);
                 return report;
@@ -73,7 +78,7 @@ public final class CompileFixLoop {
                 signatures.add(String.valueOf(d.getSource()) + ":" + d.getLineNumber() + ":" + d.getCode());
             }
             if (signatures.equals(previousSignatures)) {
-                iterations.add(new IterationSummary(i, errorsBefore, errorsBefore, 0));
+                iterations.add(new IterationSummary(i, errorsBefore, errorsBefore, 0, 0));
                 LoopReport report = new LoopReport(false, iterations, summarize(outcome.diagnostics()),
                         failingFiles(sourceRoot, outcome.diagnostics()));
                 writeReport(config, report);
@@ -81,11 +86,18 @@ public final class CompileFixLoop {
             }
             previousSignatures = signatures;
 
-            int fixesApplied = applyMechanicalFixes(sourceRoot, bucketed, classpath, config.releaseLevel());
+            FixTransaction tx = applyFixesTransactionally(sourceRoot, classOutput, outcome, bucketed, classpath,
+                    config.releaseLevel(), javac);
 
-            iterations.add(new IterationSummary(i, errorsBefore, -1 /* filled in next loop */, fixesApplied));
+            int errorsAfter = tx.outcome() != null ? tx.outcome().diagnostics().size() : errorsBefore;
+            iterations.add(new IterationSummary(i, errorsBefore, errorsAfter, tx.fixesApplied(),
+                    tx.revertedFiles().size()));
+            if (!tx.revertedFiles().isEmpty()) {
+                System.out.printf("  reverted %d file(s) a fixer made worse this iteration: %s%n",
+                        tx.revertedFiles().size(), tx.revertedFiles());
+            }
 
-            if (fixesApplied == 0) {
+            if (tx.fixesApplied() == 0) {
                 // Nothing left we know how to fix mechanically -- report the
                 // remainder for a human. Error counts are NOT compared
                 // across iterations: fixing syntax routinely reveals deeper
@@ -97,15 +109,137 @@ public final class CompileFixLoop {
                 writeReport(config, report);
                 return report;
             }
+
+            // tx.outcome() is a fresh compile of the tree exactly as it
+            // stands after this round's fixes and any per-file reverts --
+            // use it as next iteration's baseline instead of recompiling.
+            outcome = tx.outcome();
         }
 
-        JavacRunner.CompileOutcome finalOutcome = javac.compile(sourceRoot, classOutput, classpath,
-                config.releaseLevel());
-        LoopReport report = new LoopReport(finalOutcome.success(), iterations,
-                summarize(finalOutcome.diagnostics()),
-                failingFiles(sourceRoot, finalOutcome.diagnostics()));
+        LoopReport report = new LoopReport(outcome.success(), iterations,
+                summarize(outcome.diagnostics()),
+                failingFiles(sourceRoot, outcome.diagnostics()));
         writeReport(config, report);
         return report;
+    }
+
+    /** Result of one {@link #applyFixesTransactionally} call: fixes actually
+     *  kept, the (root-relative) files that were reverted, and a compile
+     *  outcome reflecting the tree exactly as fixes+reverts leave it --
+     *  {@code null} outcome iff {@code fixesApplied == 0} (nothing changed,
+     *  so no recompile was needed to evaluate anything). */
+    private record FixTransaction(int fixesApplied, List<String> revertedFiles, JavacRunner.CompileOutcome outcome) {}
+
+    /**
+     * Wraps {@link #applyMechanicalFixes} in a snapshot/apply/recompile/
+     * revert cycle so a regressing fixer can't silently make a file worse.
+     * The aggregate checks in {@link #run} (error count, equilibrium
+     * signature) only see the WHOLE tree at once, several files at a time --
+     * they would happily accept a round where nine files improved and one
+     * got worse, as long as the net count went down. This makes that one
+     * file's regression visible and undoes it on its own, keeping the
+     * other nine fixes.
+     *
+     * <p>Every {@code .java} file under {@code sourceRoot} is snapshotted
+     * before the fixers run (not just files with a current diagnostic:
+     * {@link StringConcatFixer} and {@link DecompilerArtifactFixer} scan
+     * the whole tree for their patterns regardless of what javac currently
+     * reports, so any file is a possible target). After the fixers run and
+     * the tree is recompiled once to see the result, every file whose
+     * content actually changed this round is checked: if ITS OWN error
+     * count went up relative to before, it is rewritten back to its
+     * snapshot. Files that changed but did not regress, and files no
+     * fixer touched, are left as-is.
+     *
+     * <p>"Regressed" is judged by per-file error COUNT, not by matching
+     * individual diagnostic messages: a genuine fix routinely changes what
+     * javac reports next on the same file (fixing one attribution error
+     * exposes a different one), so message-for-message comparison would
+     * misclassify ordinary progress as regression. A rising count is the
+     * signal that a fixer broke something new rather than revealed
+     * something that was already broken.
+     *
+     * <p>Costs at most two compiles beyond the one the caller already had
+     * (one to evaluate the round, one more only if a revert actually
+     * happened); reverts are expected to be the rare case -- zero of them
+     * is the common path.
+     */
+    private FixTransaction applyFixesTransactionally(Path sourceRoot, Path classOutput,
+                                                     JavacRunner.CompileOutcome before, List<DiagnosticBucketer.Bucketed> bucketed, List<Path> classpath,
+                                                     String releaseLevel, JavacRunner javac) throws IOException {
+        Map<Path, List<String>> snapshot = snapshotSources(sourceRoot);
+
+        int fixesApplied = applyMechanicalFixes(sourceRoot, bucketed, classpath, releaseLevel);
+        if (fixesApplied == 0) {
+            return new FixTransaction(0, List.of(), null);
+        }
+
+        JavacRunner.CompileOutcome after = javac.compile(sourceRoot, classOutput, classpath, releaseLevel);
+        Map<Path, Integer> beforeCounts = errorCountsByFile(before.diagnostics());
+        Map<Path, Integer> afterCounts = errorCountsByFile(after.diagnostics());
+
+        Path root = sourceRoot.toAbsolutePath().normalize();
+        List<String> reverted = new ArrayList<>();
+        for (var entry : snapshot.entrySet()) {
+            Path file = entry.getKey();
+            List<String> original = entry.getValue();
+            List<String> current;
+            try {
+                current = Files.readAllLines(file);
+            } catch (IOException e) {
+                continue; // a fixer may have removed/renamed it -- nothing to compare or restore
+            }
+            if (current.equals(original)) continue; // untouched this round
+
+            int beforeCount = beforeCounts.getOrDefault(file, 0);
+            int afterCount = afterCounts.getOrDefault(file, 0);
+            if (afterCount > beforeCount) {
+                Files.write(file, original);
+                reverted.add(root.relativize(file).toString());
+            }
+        }
+
+        JavacRunner.CompileOutcome finalOutcome = reverted.isEmpty()
+                ? after
+                : javac.compile(sourceRoot, classOutput, classpath, releaseLevel);
+        return new FixTransaction(fixesApplied, reverted, finalOutcome);
+    }
+
+    /** Every {@code .java} file under {@code sourceRoot}, snapshotted by
+     *  absolute normalized path (matching {@link #errorCountsByFile}'s keys)
+     *  so content and diagnostics for the same file line up regardless of
+     *  whether {@code sourceRoot} itself is relative. Unreadable files are
+     *  skipped rather than failing the round -- there is nothing to protect
+     *  for a file that can't be read anyway. */
+    private static Map<Path, List<String>> snapshotSources(Path sourceRoot) throws IOException {
+        Map<Path, List<String>> snapshot = new LinkedHashMap<>();
+        try (Stream<Path> walk = Files.walk(sourceRoot)) {
+            for (Path p : (Iterable<Path>) walk.filter(f -> f.toString().endsWith(".java"))::iterator) {
+                try {
+                    snapshot.put(p.toAbsolutePath().normalize(), Files.readAllLines(p));
+                } catch (IOException ignored) {
+                    // Unreadable -- not this round's problem to fix.
+                }
+            }
+        }
+        return snapshot;
+    }
+
+    /** Per-file ERROR diagnostic counts, keyed by absolute normalized source
+     *  path so they line up with {@link #snapshotSources}'s keys regardless
+     *  of how the diagnostic's own file object spells its path. */
+    private static Map<Path, Integer> errorCountsByFile(List<Diagnostic<? extends JavaFileObject>> diagnostics) {
+        Map<Path, Integer> counts = new HashMap<>();
+        for (var d : diagnostics) {
+            if (d.getSource() == null) continue;
+            try {
+                Path file = Path.of(d.getSource().toUri()).toAbsolutePath().normalize();
+                counts.merge(file, 1, Integer::sum);
+            } catch (Exception ignored) {
+                // Unresolvable source -- not attributable to a file.
+            }
+        }
+        return counts;
     }
 
     /** Distinct slash-form internal names with at least one error, derived

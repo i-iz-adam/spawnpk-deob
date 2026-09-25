@@ -61,6 +61,12 @@ public record MemberRenameEntry(
      *  remapper could rewrite), so renaming one breaks all of them.
      *  Never renamed, not even via a custom override. */
     public static final String REASON_ANNOTATION_ELEMENT = "annotation-element-not-renamed";
+    /** Method-only: this is the real implementation behind a compiler
+     *  bridge method, renamed to match the bridge. In source the two share
+     *  one name (the bridge is generated from the implementation), but an
+     *  obfuscator renamed them independently -- the bridge keeping the name
+     *  of the library method it overrides, the implementation getting junk. */
+    public static final String REASON_BRIDGE_TARGET = "bridge-target-name";
     /** Name is already at/above minKeepableLength and source-legal, so it
      *  looks genuine (e.g. Client, eventBus) rather than obfuscator junk
      *  (a, b, x1) -- left alone by default. */

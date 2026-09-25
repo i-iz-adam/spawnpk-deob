@@ -123,6 +123,29 @@ final class MethodOverrideGroups {
         return new Result(groups, poison, external);
     }
 
+    /**
+     * True when {@code m} (declared by {@code hdr}) overrides or implements
+     * a method of some supertype -- a type in the jar that declares the
+     * same name+descriptor, or a JDK/library type that does. Uses exactly
+     * the same hierarchy walk as {@link #build}, so "overrides" means the
+     * same thing here as it does for family grouping.
+     */
+    static boolean overridesSomething(RawClassHeader hdr, RawClassHeader.Member m,
+                                      Map<String, RawClassHeader> byName) {
+        if (m.name().equals("<init>") || m.name().equals("<clinit>")) return false;
+        if ((m.access() & (Opcodes.ACC_STATIC | Opcodes.ACC_PRIVATE)) != 0) return false;
+        Set<String> visited = new HashSet<>();
+        boolean[] touchesExternal = {false};
+        List<String> declaringAncestors = new ArrayList<>();
+        if (!hdr.isInterface && hdr.superName != null) {
+            walk(hdr.superName, m.name(), m.descriptor(), byName, visited, declaringAncestors, touchesExternal);
+        }
+        for (String itf : hdr.interfaces) {
+            walk(itf, m.name(), m.descriptor(), byName, visited, declaringAncestors, touchesExternal);
+        }
+        return touchesExternal[0] || !declaringAncestors.isEmpty();
+    }
+
     /** {@code java/lang/Object}'s full declared method set. Object is never
      *  bundled in the jar, so a naive "missing ancestor = external contract"
      *  rule poisons EVERY virtual method in EVERY class that transitively

@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.jar.JarEntry;
@@ -63,9 +64,18 @@ public final class Stage0Runner {
         System.out.printf("  %d class/package renames computed in %.1fs%n",
                 classRenameResult.manifestEntries().size(), elapsedSec(t1));
 
+        long tLambda = System.currentTimeMillis();
+        System.out.println("  finding lambda bodies and bridge methods the obfuscator's flags no longer mark...");
+        CompilerArtifactAnalysis.Result repairs = CompilerArtifactAnalysis.analyze(loaded.classes());
+        System.out.printf("  found %d lambda bod%s and %d compiler bridge%s in %.1fs%n",
+                repairs.lambdaBodies().size(), repairs.lambdaBodies().size() == 1 ? "y" : "ies",
+                repairs.bridgeToTarget().size(), repairs.bridgeToTarget().size() == 1 ? "" : "s",
+                elapsedSec(tLambda));
+
         long t2 = System.currentTimeMillis();
         System.out.println("  building field/method rename map...");
-        MemberRenamePlanner.Result memberRenameResult = new MemberRenamePlanner().plan(loaded.classes(), overrides);
+        MemberRenamePlanner.Result memberRenameResult =
+                new MemberRenamePlanner().plan(loaded.classes(), overrides, repairs);
         long memberRenamedCount = memberRenameResult.manifestEntries().stream().filter(e -> !e.kept()).count();
         System.out.printf("  %d field/method renames computed (%d left unrenamed on purpose) in %.1fs%n",
                 memberRenamedCount, memberRenameResult.manifestEntries().size() - memberRenamedCount, elapsedSec(t2));
@@ -75,12 +85,12 @@ public final class Stage0Runner {
         BytecodeNormalizer.Result normResult = new BytecodeNormalizer().normalizeAll(
                 loaded.classes(), classRenameResult.renameMap(),
                 memberRenameResult.methodRenameMap(), memberRenameResult.fieldRenameMap(),
-                config.decompileLibraries());
+                config.decompileLibraries(), repairs);
         System.out.printf("  normalization done in %.1fs%n", elapsedSec(t3));
 
         writeJar(config, normResult.normalizedClasses(), loaded.resources());
         writeManifest(config, classRenameResult.manifestEntries(), memberRenameResult.manifestEntries(),
-                normResult.warnings());
+                normResult.warnings(), memberRenameResult.notes());
 
         return new Stage0Output(
                 normResult.normalizedClasses(),
@@ -112,17 +122,19 @@ public final class Stage0Runner {
 
     private void writeManifest(PipelineConfig config, List<RenameEntry> classRenames,
                                List<MemberRenameEntry> memberRenames,
-                               List<BytecodeNormalizer.Warning> warnings) throws IOException {
+                               List<BytecodeNormalizer.Warning> warnings,
+                               List<String> plannerNotes) throws IOException {
         var mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
-        var doc = Map.of(
-                "classRenameCount", classRenames.size(),
-                "memberRenameCount", memberRenames.stream().filter(e -> !e.kept()).count(),
-                "memberKeptCount", memberRenames.stream().filter(MemberRenameEntry::kept).count(),
-                "warningCount", warnings.size(),
-                "classRenames", classRenames,
-                "memberRenames", memberRenames,
-                "warnings", warnings
-        );
+        var doc = new LinkedHashMap<String, Object>();
+        doc.put("classRenameCount", classRenames.size());
+        doc.put("memberRenameCount", memberRenames.stream().filter(e -> !e.kept()).count());
+        doc.put("memberKeptCount", memberRenames.stream().filter(MemberRenameEntry::kept).count());
+        doc.put("warningCount", warnings.size());
+        doc.put("plannerNoteCount", plannerNotes.size());
+        doc.put("classRenames", classRenames);
+        doc.put("memberRenames", memberRenames);
+        doc.put("warnings", warnings);
+        doc.put("plannerNotes", plannerNotes);
         mapper.writeValue(config.stage0ManifestPath().toFile(), doc);
     }
 }

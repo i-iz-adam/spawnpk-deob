@@ -40,18 +40,31 @@ public final class MemberRenamePlanner {
     public record Result(
             Map<String, String> methodRenameMap, // MemberKeyParts.methodKey(...) -> new simple name
             Map<String, String> fieldRenameMap,  // MemberKeyParts.fieldKey(...) -> new simple name
-            List<MemberRenameEntry> manifestEntries
-    ) {}
+            List<MemberRenameEntry> manifestEntries,
+            List<String> notes                   // planner observations, surfaced in the Stage 0 manifest
+    ) {
+        public Result(Map<String, String> methodRenameMap, Map<String, String> fieldRenameMap,
+                      List<MemberRenameEntry> manifestEntries) {
+            this(methodRenameMap, fieldRenameMap, manifestEntries, List.of());
+        }
+    }
 
     public Result plan(List<ClassInfo> allClasses, CustomNameOverrides overrides) {
+        return plan(allClasses, overrides, CompilerArtifactAnalysis.Result.empty());
+    }
+
+    Result plan(List<ClassInfo> allClasses, CustomNameOverrides overrides,
+                CompilerArtifactAnalysis.Result repairs) {
         Map<String, RawClassHeader> byName = RawClassHeader.indexAll(allClasses);
+        List<String> notes = new ArrayList<>();
 
         Map<String, String> fieldRenameMap = new LinkedHashMap<>();
         Map<String, String> methodRenameMap = new LinkedHashMap<>();
         List<MemberRenameEntry> manifest = new ArrayList<>();
 
         planFields(allClasses, byName, overrides, fieldRenameMap, manifest);
-        planMethods(byName, overrides, methodRenameMap, manifest);
+        MethodOverrideGroups.Result groups = planMethods(byName, overrides, methodRenameMap, manifest);
+        unifyBridgeTargetNames(repairs.bridgeToTarget(), groups, byName, overrides, methodRenameMap, manifest, notes);
 
         // Bytecode names the STATIC receiver type in member refs, which is
         // often a subclass that merely inherits the member (Client.hQ where
@@ -63,7 +76,7 @@ public final class MemberRenamePlanner {
         propagateToSubclasses(fieldRenameMap, byName, true);
         propagateToSubclasses(methodRenameMap, byName, false);
 
-        return new Result(methodRenameMap, fieldRenameMap, manifest);
+        return new Result(methodRenameMap, fieldRenameMap, manifest, notes);
     }
 
     private void propagateToSubclasses(Map<String, String> renameMap, Map<String, RawClassHeader> byName,
@@ -151,8 +164,10 @@ public final class MemberRenamePlanner {
         }
     }
 
-    private void planMethods(Map<String, RawClassHeader> byName, CustomNameOverrides overrides,
-                              Map<String, String> methodRenameMap, List<MemberRenameEntry> manifest) {
+    private MethodOverrideGroups.Result planMethods(Map<String, RawClassHeader> byName,
+                                                    CustomNameOverrides overrides,
+                                                    Map<String, String> methodRenameMap,
+                                                    List<MemberRenameEntry> manifest) {
         MethodOverrideGroups.Result groups = MethodOverrideGroups.build(byName);
 
         Set<String> reserved = new HashSet<>(overrides.allCustomMethodNewNames());
@@ -245,6 +260,123 @@ public final class MemberRenamePlanner {
                 manifest.add(MemberRenameEntry.renamedMethod(parts.owner(), parts.name(), parts.descriptor(), finalName, reason));
             }
         }
+        return groups;
+    }
+
+    /**
+     * A compiler bridge and the implementation it forwards to are one
+     * method in source, so they must share one name. The obfuscated jar
+     * splits them: the bridge keeps the name of the library method it
+     * overrides (so its family is hard-protected and never renamed) while
+     * the implementation, whose descriptor matches nothing external, is
+     * renamed independently to {@code methodNNNN}. The decompiler then has
+     * a real {@code load(Object)} and a real {@code method2006(K)} and can
+     * express neither as an override.
+     *
+     * <p>The bridge's final name is the truth -- it is load-bearing -- so
+     * the implementation's whole override family is renamed to it. A pair
+     * is skipped (and noted) rather than forced when the implementation's
+     * family is itself protected, the user pinned a name for it, two
+     * bridges disagree, or the new name would collide within a class.
+     */
+    private void unifyBridgeTargetNames(Map<String, String> bridgeToTarget, MethodOverrideGroups.Result groups,
+                                        Map<String, RawClassHeader> byName, CustomNameOverrides overrides,
+                                        Map<String, String> methodRenameMap, List<MemberRenameEntry> manifest,
+                                        List<String> notes) {
+        if (bridgeToTarget.isEmpty()) return;
+        Map<String, String> rootOf = new HashMap<>();
+        for (var group : groups.groups().entrySet()) {
+            for (String member : group.getValue()) rootOf.put(member, group.getKey());
+        }
+        Map<String, String> assignedByRoot = new HashMap<>();
+        int unified = 0;
+
+        for (var pair : new java.util.TreeMap<>(bridgeToTarget).entrySet()) {
+            String bridgeKey = pair.getKey();
+            String targetKey = pair.getValue();
+            String bridgeName = methodRenameMap.getOrDefault(bridgeKey, MemberKeyParts.parseMethodKey(bridgeKey).name());
+            String targetRoot = rootOf.get(targetKey);
+            if (targetRoot == null) {
+                notes.add("bridge " + bridgeKey + ": target " + targetKey + " has no override family; left alone");
+                continue;
+            }
+            Set<String> members = groups.groups().get(targetRoot);
+            String currentName = methodRenameMap.getOrDefault(targetKey, MemberKeyParts.parseMethodKey(targetKey).name());
+            if (currentName.equals(bridgeName)) continue; // already agree
+
+            if (groups.poisonedRoots().getOrDefault(targetRoot, false)
+                    || groups.externalRoots().getOrDefault(targetRoot, false)) {
+                notes.add("bridge " + bridgeKey + ": target family is name-protected; cannot rename " + targetKey
+                        + " to \"" + bridgeName + "\"");
+                continue;
+            }
+            if (hasCustomInstruction(members, overrides)) {
+                notes.add("bridge " + bridgeKey + ": custom-names pins " + targetKey
+                        + "; not overriding it with \"" + bridgeName + "\"");
+                continue;
+            }
+            String previous = assignedByRoot.putIfAbsent(targetRoot, bridgeName);
+            if (previous != null && !previous.equals(bridgeName)) {
+                notes.add("bridge " + bridgeKey + ": conflicting bridge names (\"" + previous + "\" vs \""
+                        + bridgeName + "\") for " + targetKey + "; kept the first");
+                continue;
+            }
+            if (collides(members, bridgeName, byName, methodRenameMap)) {
+                assignedByRoot.remove(targetRoot);
+                notes.add("bridge " + bridgeKey + ": renaming " + targetKey + " to \"" + bridgeName
+                        + "\" would collide with an existing method; left alone");
+                continue;
+            }
+
+            for (String member : members) {
+                MemberKeyParts.Parts parts = MemberKeyParts.parseMethodKey(member);
+                manifest.removeIf(e -> MemberRenameEntry.KIND_METHOD.equals(e.kind())
+                        && e.owner().equals(parts.owner()) && e.originalName().equals(parts.name())
+                        && e.descriptor().equals(parts.descriptor()));
+                if (bridgeName.equals(parts.name())) {
+                    methodRenameMap.remove(member);
+                    manifest.add(MemberRenameEntry.keptMethod(parts.owner(), parts.name(), parts.descriptor(),
+                            MemberRenameEntry.REASON_BRIDGE_TARGET));
+                } else {
+                    methodRenameMap.put(member, bridgeName);
+                    manifest.add(MemberRenameEntry.renamedMethod(parts.owner(), parts.name(), parts.descriptor(),
+                            bridgeName, MemberRenameEntry.REASON_BRIDGE_TARGET));
+                }
+            }
+            unified++;
+        }
+        if (unified > 0) {
+            notes.add("bridge unification: " + unified + " implementation famil" + (unified == 1 ? "y" : "ies")
+                    + " renamed to match their compiler bridge");
+        }
+    }
+
+    private boolean hasCustomInstruction(Set<String> members, CustomNameOverrides overrides) {
+        for (String member : members) {
+            MemberKeyParts.Parts parts = MemberKeyParts.parseMethodKey(member);
+            if (overrides.methodOverride(parts.owner(), parts.name(), parts.descriptor()) != null) return true;
+        }
+        return false;
+    }
+
+    /** True if giving every member of the family {@code newName} would
+     *  produce two methods with one name+descriptor in some class. */
+    private boolean collides(Set<String> members, String newName, Map<String, RawClassHeader> byName,
+                             Map<String, String> methodRenameMap) {
+        for (String member : members) {
+            MemberKeyParts.Parts parts = MemberKeyParts.parseMethodKey(member);
+            RawClassHeader owner = byName.get(parts.owner());
+            if (owner == null) continue;
+            for (RawClassHeader.Member other : owner.methods) {
+                if (!other.descriptor().equals(parts.descriptor())) continue;
+                if (other.name().equals(parts.name())) continue; // the member itself
+                String otherKey = MemberKeyParts.methodKey(parts.owner(), other.name(), other.descriptor());
+                if (members.contains(otherKey)) continue;
+                String otherFinal = methodRenameMap.getOrDefault(otherKey, other.name());
+                if (otherFinal.equals(newName)) return true;
+            }
+        }
+        return false;
     }
 
     private void addKeptMethods(Set<String> members, String reason, List<MemberRenameEntry> manifest) {

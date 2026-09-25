@@ -37,6 +37,16 @@ import java.util.Set;
  *   <li><b>Synthetic bridge/access methods</b> -- not stripped here, but
  *       every one is logged to the warnings list so Stage 4's
  *       duplicate-bridge-method fixer knows where to look first.</li>
+ *   <li><b>Lambda bodies and bridge methods</b> -- {@link #normalizeOne}
+ *       clears {@code ACC_SYNTHETIC} from every in-scope member, same as
+ *       always, but then restores {@code ACC_SYNTHETIC} (and, for bridges,
+ *       {@code ACC_BRIDGE}) on exactly the methods
+ *       {@link CompilerArtifactAnalysis} identified structurally as lambda
+ *       bodies or compiler bridges. Both decompilers key their "hide this
+ *       method, inline/skip it instead" behavior off these flags rather
+ *       than the name, so leaving them cleared is what breaks captured
+ *       lambda arguments and leaks bridge bodies as bogus overrides in the
+ *       first place.</li>
  *   <li><b>Local variable and parameter names</b> -- where debug info
  *       survives, {@code ClassRemapper} doesn't touch these on its own (it
  *       only remaps TYPE references, not the variable's own name string),
@@ -78,6 +88,13 @@ public final class BytecodeNormalizer {
     public Result normalizeAll(List<ClassInfo> allClasses, Map<String, String> classRenameMap,
                                 Map<String, String> methodRenameMap, Map<String, String> fieldRenameMap,
                                 boolean stripSyntheticForLibraries) {
+        return normalizeAll(allClasses, classRenameMap, methodRenameMap, fieldRenameMap,
+                stripSyntheticForLibraries, CompilerArtifactAnalysis.Result.empty());
+    }
+
+    public Result normalizeAll(List<ClassInfo> allClasses, Map<String, String> classRenameMap,
+                                Map<String, String> methodRenameMap, Map<String, String> fieldRenameMap,
+                                boolean stripSyntheticForLibraries, CompilerArtifactAnalysis.Result repairs) {
         Map<String, TypeInfo> typeHierarchy = buildTypeHierarchy(allClasses, classRenameMap);
         QualifiedRemapper remapper = new QualifiedRemapper(classRenameMap, methodRenameMap, fieldRenameMap);
         List<ClassInfo> out = new ArrayList<>(allClasses.size());
@@ -95,7 +112,7 @@ public final class BytecodeNormalizer {
             try {
                 String newName = classRenameMap.getOrDefault(ci.internalName(), ci.internalName());
                 byte[] normalized = normalizeOne(ci, remapper, typeHierarchy, warnings, false,
-                        ci.inScope() || stripSyntheticForLibraries);
+                        ci.inScope() || stripSyntheticForLibraries, repairs);
                 // The bytes now declare the RENAMED class; the model must
                 // follow, or every downstream stage (stage0 jar entries,
                 // Stage 1 output paths/stub headers, Stage 3 vendoring)
@@ -111,7 +128,7 @@ public final class BytecodeNormalizer {
                 try {
                     String newName = classRenameMap.getOrDefault(ci.internalName(), ci.internalName());
                     byte[] normalized = normalizeOne(ci, remapper, typeHierarchy, warnings, true,
-                            ci.inScope() || stripSyntheticForLibraries);
+                            ci.inScope() || stripSyntheticForLibraries, repairs);
                     out.add(new ClassInfo(newName, normalized, ci.inScope()));
                     warnings.add(new Warning(ci.internalName(),
                             "recovered by discarding debug info after: " + primaryFailure));
@@ -156,7 +173,8 @@ public final class BytecodeNormalizer {
     }
 
     private byte[] normalizeOne(ClassInfo ci, QualifiedRemapper remapper, Map<String, TypeInfo> typeHierarchy,
-                                 List<Warning> warnings, boolean skipDebug, boolean stripSynthetic) {
+                                 List<Warning> warnings, boolean skipDebug, boolean stripSynthetic,
+                                 CompilerArtifactAnalysis.Result repairs) {
         int readFlags = skipDebug ? ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES
                                    : ClassReader.SKIP_FRAMES;
 
@@ -183,11 +201,26 @@ public final class BytecodeNormalizer {
 
         for (Object mObj : node.methods) {
             MethodNode m = (MethodNode) mObj;
+
+            // Undo the strip above for methods CompilerArtifactAnalysis
+            // proved are compiler artifacts, not real obfuscator targets:
+            // both decompilers hide/inline strictly by flag, never by name.
+            if (repairs.isLambdaBody(ci.internalName(), m.name, m.desc)) {
+                m.access |= Opcodes.ACC_SYNTHETIC;
+                warnings.add(new Warning(ci.internalName(),
+                        "lambda body re-flagged synthetic (captures would otherwise be dropped): "
+                                + m.name + m.desc));
+            } else if (repairs.isBridge(ci.internalName(), m.name, m.desc)) {
+                m.access |= Opcodes.ACC_SYNTHETIC | Opcodes.ACC_BRIDGE;
+                warnings.add(new Warning(ci.internalName(),
+                        "compiler bridge re-flagged synthetic+bridge (was leaking as a bogus override): "
+                                + m.name + m.desc));
+            } else if (!skipDebug && ((m.access & Opcodes.ACC_BRIDGE) != 0 || (m.access & Opcodes.ACC_SYNTHETIC) != 0)) {
+                warnings.add(new Warning(ci.internalName(),
+                        "synthetic/bridge method retained: " + m.name + m.desc));
+            }
+
             if (!skipDebug) {
-                if ((m.access & Opcodes.ACC_BRIDGE) != 0 || (m.access & Opcodes.ACC_SYNTHETIC) != 0) {
-                    warnings.add(new Warning(ci.internalName(),
-                            "synthetic/bridge method retained: " + m.name + m.desc));
-                }
                 renameLocalsAndParameters(m);
             }
         }
