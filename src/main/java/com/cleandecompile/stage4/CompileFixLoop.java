@@ -38,6 +38,9 @@ import java.util.stream.Stream;
  */
 public final class CompileFixLoop {
 
+    private static final Pattern METHOD_HEADER = Pattern.compile(
+            "^\\s*+(?!if\\b|for\\b|while\\b|switch\\b|catch\\b|synchronized\\b|do\\b|else\\b|try\\b)(?:(?:public|private|protected|static|final|synchronized|native|abstract|strictfp)\\s+)*[\\w.$<>\\[\\],? ]*\\w+\\s*\\([^;{}]*\\)\\s*(?:throws\\s+[\\w., ]+)?\\s*\\{\\s*$");
+
     private final DiagnosticBucketer bucketer = new DiagnosticBucketer();
 
     public record IterationSummary(int iteration, int errorCountBefore, int errorCountAfter, int autoFixesApplied,
@@ -354,6 +357,12 @@ public final class CompileFixLoop {
         fixes += collectionFixes;
         bucketed = collectionFix.unhandled(bucketed);
 
+        InferredTypeFixer.Result inferredFix =
+                InferredTypeFixer.tryFixAll(sourceRoot, bucketed);
+        int inferredTypeFixes = inferredFix.fixes();
+        fixes += inferredTypeFixes;
+        bucketed = inferredFix.unhandled(bucketed);
+
         ResidualSyntaxFixer.Result residualSyntaxFix =
                 ResidualSyntaxFixer.tryFixAll(sourceRoot, bucketed);
         int residualSyntaxFixes = residualSyntaxFix.fixes();
@@ -427,8 +436,8 @@ public final class CompileFixLoop {
         fixes += voidAbstractFixes;
 
         if (fixes > 0) {
-            System.out.printf("  fixes applied: diamond=%d arrayRetype=%d split=%d objectTyped=%d lambdaRestore=%d memberResolution=%d collectionSource=%d residualSyntax=%d duplicateLocal=%d residualAccess=%d imports=%d concat=%d casts=%d artifacts=%d compare=%d widen=%d receiver=%d wrap=%d voidAbstractStub=%d%n",
-                    diamondFixes, arrayFixes, splitFixes, objectFixes, lambdaFixes, memberFixes, collectionFixes, residualSyntaxFixes, duplicateFixes, residualFixes, importFixes, concatFixes, castFixes, artifactFixes, compareFixes, widenFixes, receiverFixes, wrapFixes, voidAbstractFixes);
+            System.out.printf("  fixes applied: diamond=%d arrayRetype=%d split=%d objectTyped=%d lambdaRestore=%d memberResolution=%d collectionSource=%d inferredType=%d residualSyntax=%d duplicateLocal=%d residualAccess=%d imports=%d concat=%d casts=%d artifacts=%d compare=%d widen=%d receiver=%d wrap=%d voidAbstractStub=%d%n",
+                    diamondFixes, arrayFixes, splitFixes, objectFixes, lambdaFixes, memberFixes, collectionFixes, inferredTypeFixes, residualSyntaxFixes, duplicateFixes, residualFixes, importFixes, concatFixes, castFixes, artifactFixes, compareFixes, widenFixes, receiverFixes, wrapFixes, voidAbstractFixes);
         }
 
         // TODO: DUPLICATE_METHOD -- remove the redundant bridge method
@@ -3394,9 +3403,13 @@ public final class CompileFixLoop {
                 "incompatible types:\\s*(?:[A-Za-z_$][\\w.$]*\\.)*Stream(?:<[^<>]*>)?\\s+cannot be converted to\\s+([A-Za-z_$][\\w.$]*)");
         private static final Pattern CAST = Pattern.compile(
                 "\\(\\s*([A-Za-z_$][\\w.$]*(?:<[^<>]*>)?)\\s*\\)");
+        private static final Pattern ELEMENT_DEMAND = Pattern.compile(
+                "incompatible types:\\s+(?:java\\.lang\\.)?Object cannot be converted to "
+                        + "([A-Za-z_$][\\w$.]*)(?![\\w$.<])");
         private static final Pattern RAW_COLLECTION = Pattern.compile(
                 "(?:java\\.util\\.)?(?:List|Collection|Set|Iterable)");
         private static final String MAPPING_CALL = ".mapToInt(";
+        private static final String STREAM_CALL = ".stream()";
         private static final List<String> GUARDED_PACKAGES = List.of("java.lang.", "java.util.");
         private static final Set<String> WRAPPERS = Set.of(
                 "Boolean", "Byte", "Character", "Double", "Float", "Integer", "Long", "Short");
@@ -3416,6 +3429,12 @@ public final class CompileFixLoop {
         private record Splice(int start, int end, String text) {
             String applyTo(String line) {
                 return line.substring(0, start) + text + line.substring(end);
+            }
+        }
+
+        private record Edit(int line, int start, int end, String text) {
+            void applyTo(List<String> lines) {
+                lines.set(line, lines.get(line).substring(0, start) + text + lines.get(line).substring(end));
             }
         }
 
@@ -3471,9 +3490,9 @@ public final class CompileFixLoop {
                     if (lineNo < 1 || lineNo > lines.size()) continue;
                     if (!seen.add(lineNo + "|" + message)) continue;
                     int index = (int) lineNo - 1;
-                    Splice splice = rewrite(code.get(index), message, scope);
-                    if (splice == null) continue;
-                    lines.set(index, splice.applyTo(lines.get(index)));
+                    List<Edit> edits = rewrite(code, index, message, scope);
+                    if (edits.isEmpty()) continue;
+                    for (Edit edit : edits) edit.applyTo(lines);
                     code = LambdaRestoreFixer.lexicalLines(lines);
                     changed = true;
                     fixed++;
@@ -3504,12 +3523,137 @@ public final class CompileFixLoop {
             return new Scope(pkg, imports, onDemand);
         }
 
-        private static Splice rewrite(String code, String message, Scope scope) {
-            Splice forEach = dropForEachObjectCast(code, message);
-            if (forEach != null) return forEach;
-            Splice receiver = parameterizeStreamReceiver(code, message, scope);
-            if (receiver != null) return receiver;
-            return retypeStreamCast(code, message, scope);
+        private static List<Edit> rewrite(List<String> code, int index, String message, Scope scope) {
+            List<Edit> parameterized = parameterizeRawCollectionSource(code, index, message, scope);
+            if (!parameterized.isEmpty()) return parameterized;
+            String flagged = code.get(index);
+            Splice forEach = dropForEachObjectCast(flagged, message);
+            if (forEach != null) return List.of(new Edit(index, forEach.start(), forEach.end(), forEach.text()));
+            Splice receiver = parameterizeStreamReceiver(flagged, message, scope);
+            if (receiver != null) {
+                return List.of(new Edit(index, receiver.start(), receiver.end(), receiver.text()));
+            }
+            Splice cast = retypeStreamCast(flagged, message, scope);
+            if (cast != null) return List.of(new Edit(index, cast.start(), cast.end(), cast.text()));
+            return List.of();
+        }
+
+        private static List<Edit> parameterizeRawCollectionSource(List<String> code, int index,
+                                                                   String message, Scope scope) {
+            Matcher demand = ELEMENT_DEMAND.matcher(message);
+            if (!demand.find()) return List.of();
+            String target = demand.group(1).trim();
+            if (target.isEmpty()) return List.of();
+            String flagged = code.get(index);
+            int[] receiver = soleStreamReceiver(flagged);
+            if (receiver == null) return List.of();
+            String source = flagged.substring(receiver[0], receiver[1]);
+            int declaration = rawCollectionLocal(code, index, source);
+            if (declaration < 0) return List.of();
+            Matcher declared = localDeclaration(source).matcher(code.get(declaration));
+            if (!declared.find()) return List.of();
+            String spelled = declared.group(1);
+            String parameterizedType = spelled + "<" + bindElement(target, scope) + ">";
+            if (parameterizedType.equals(spelled)) return List.of();
+            if (!soleUseAfterDeclaration(code, declaration, index, source)) return List.of();
+            List<Edit> edits = new ArrayList<>();
+            edits.add(new Edit(declaration, declared.start(1), declared.end(1), parameterizedType));
+            int[] cast = deadElementCast(flagged, receiver[0], target, scope);
+            if (cast != null) edits.add(new Edit(index, cast[0], cast[1], ""));
+            return edits;
+        }
+
+        private static int[] soleStreamReceiver(String code) {
+            int at = code.indexOf(STREAM_CALL);
+            if (at < 0) return null;
+            if (code.indexOf(STREAM_CALL, at + 1) >= 0) return null;
+            int end = skipWhitespaceBackwards(code, at - 1);
+            if (end < 0 || !Character.isJavaIdentifierPart(code.charAt(end))) return null;
+            int start = end;
+            while (start > 0 && Character.isJavaIdentifierPart(code.charAt(start - 1))) start--;
+            if (!Character.isJavaIdentifierStart(code.charAt(start))) return null;
+            if (start > 0 && code.charAt(start - 1) == '.') return null;
+            return new int[]{start, end + 1};
+        }
+
+        private static Pattern localDeclaration(String name) {
+            return Pattern.compile("(?<![\\w$.])(?:final\\s+)?"
+                    + "([A-Za-z_$][\\w.$]*(?:\\s*<[^<>]*>)?(?:\\s*\\[\\s*\\])*)\\s+"
+                    + Pattern.quote(name) + "\\s*(?==)");
+        }
+
+        private static int rawCollectionLocal(List<String> code, int flagged, String name) {
+            Pattern declaration = localDeclaration(name);
+            int depth = depthAtStart(code, flagged);
+            int found = -1;
+            for (int i = flagged - 1; i >= 0; i--) {
+                String line = code.get(i);
+                if (atMethodBoundary(line, depth)) break;
+                Matcher m = declaration.matcher(line);
+                if (m.find()) {
+                    if (found >= 0) return -1;
+                    if (!RAW_COLLECTION.matcher(m.group(1).replaceAll("\\s+", "")).matches()) return -1;
+                    found = i;
+                }
+                depth -= braceDelta(line);
+            }
+            return found;
+        }
+
+        private static boolean atMethodBoundary(String line, int depth) {
+            return depth <= 1;
+        }
+
+        private static boolean soleUseAfterDeclaration(List<String> code, int declaration, int flagged,
+                                                       String name) {
+            Pattern word = Pattern.compile("(?<![\\w$.])" + Pattern.quote(name) + "(?![\\w$])");
+            int depth = 0;
+            int found = 0;
+            for (int i = declaration + 1; i < code.size(); i++) {
+                String line = code.get(i);
+                Matcher m = word.matcher(line);
+                while (m.find()) {
+                    found++;
+                    if (i != flagged) return false;
+                }
+                depth += braceDelta(line);
+                if (depth < 0) break;
+            }
+            return found == 1;
+        }
+
+        private static int depthAtStart(List<String> code, int line) {
+            int depth = 0;
+            for (int i = 0; i < line; i++) depth += braceDelta(code.get(i));
+            return depth;
+        }
+
+        private static int braceDelta(String code) {
+            int delta = 0;
+            for (int i = 0; i < code.length(); i++) {
+                char c = code.charAt(i);
+                if (c == '{') delta++;
+                else if (c == '}') delta--;
+            }
+            return delta;
+        }
+
+        private static String bindElement(String target, Scope scope) {
+            if (!target.contains(".")) return target;
+            return scope.binds(simpleName(target), target) ? simpleName(target) : target;
+        }
+
+        private static int[] deadElementCast(String code, int receiverStart, String target, Scope scope) {
+            int close = skipWhitespaceBackwards(code, receiverStart - 1);
+            if (close < 0 || code.charAt(close) != ')') return null;
+            int open = matchingParenBackwards(code, close);
+            if (open <= 0) return null;
+            if (!Character.isWhitespace(code.charAt(open - 1))) return null;
+            String spelled = code.substring(open + 1, close).replaceAll("\\s+", "");
+            if (!spelled.equals(target) && !spelled.equals(bindElement(target, scope))) return null;
+            int end = skipWhitespace(code, close + 1, code.length());
+            if (end > receiverStart) return null;
+            return new int[]{open, end};
         }
 
         private static Splice dropForEachObjectCast(String code, String message) {
@@ -4085,6 +4229,367 @@ public final class CompileFixLoop {
                 }
             }
             return false;
+        }
+    }
+
+    static final class InferredTypeFixer {
+        private static final Pattern OPERAND_MISMATCH = Pattern.compile(
+                "bad operand types for binary operator '(!=|==)'\\s+first type:\\s+"
+                        + "(?:java\\.lang\\.)?Object\\s+second type:\\s+([\\w$]+)(?=\\s|$)",
+                Pattern.DOTALL);
+        private static final Set<String> PRIMITIVES = Set.of(
+                "boolean", "byte", "char", "short", "int", "long", "float", "double");
+        private static final Set<String> OBJECT_SPELLINGS = Set.of("Object", "java.lang.Object");
+        private static final Set<String> PRIMITIVE_ARRAY_PRODUCERS = Set.of("char", "byte");
+        private static final Pattern FINAL = Pattern.compile("final\\s+");
+        private static final Pattern TO_ARRAY_CALL = Pattern.compile("to([A-Za-z]+)Array");
+        private static final Pattern DOTTED_RECEIVER = Pattern.compile(
+                "[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*(?:\\(\\))?)*(?:\\(\\))?");
+
+        record Result(int fixes, List<Diagnostic<? extends JavaFileObject>> handled) {
+            List<DiagnosticBucketer.Bucketed> unhandled(List<DiagnosticBucketer.Bucketed> all) {
+                if (handled.isEmpty()) return all;
+                return all.stream().filter(b -> !handled.contains(b.diagnostic())).toList();
+            }
+
+            static final Result NONE = new Result(0, List.of());
+        }
+
+        private record Splice(int line, int start, int end, String text) {
+            void applyTo(List<String> lines) {
+                String target = lines.get(line);
+                lines.set(line, target.substring(0, start) + text + target.substring(end));
+            }
+        }
+
+        private InferredTypeFixer() {
+        }
+
+        static Result tryFixAll(Path sourceRoot, List<DiagnosticBucketer.Bucketed> bucketed) throws IOException {
+            Map<Path, List<DiagnosticBucketer.Bucketed>> byFile = new LinkedHashMap<>();
+            for (var b : bucketed) {
+                if (b.diagnostic().getSource() == null) continue;
+                Path file;
+                try {
+                    file = Path.of(b.diagnostic().getSource().toUri()).toAbsolutePath().normalize();
+                } catch (RuntimeException e) {
+                    continue;
+                }
+                if (!file.startsWith(sourceRoot.toAbsolutePath().normalize())) continue;
+                byFile.computeIfAbsent(file, f -> new ArrayList<>()).add(b);
+            }
+            int fixed = 0;
+            List<Diagnostic<? extends JavaFileObject>> handled = new ArrayList<>();
+            for (var entry : byFile.entrySet()) {
+                List<String> lines;
+                try {
+                    lines = new ArrayList<>(Files.readAllLines(entry.getKey()));
+                } catch (IOException ioe) {
+                    continue;
+                }
+                List<String> code = LambdaRestoreFixer.lexicalLines(lines);
+                Set<String> seen = new HashSet<>();
+                boolean changed = false;
+                for (var b : entry.getValue()) {
+                    String message = b.diagnostic().getMessage(Locale.ENGLISH);
+                    long lineNo = b.diagnostic().getLineNumber();
+                    if (lineNo < 1 || lineNo > lines.size()) continue;
+                    if (!seen.add(lineNo + "|" + message)) continue;
+                    int index = (int) lineNo - 1;
+                    Splice splice = retypeForEachVariable(code, index, message);
+                    if (splice == null) continue;
+                    splice.applyTo(lines);
+                    code = LambdaRestoreFixer.lexicalLines(lines);
+                    changed = true;
+                    fixed++;
+                    handled.add(b.diagnostic());
+                }
+                if (changed) Files.write(entry.getKey(), lines);
+            }
+            return fixed == 0 ? Result.NONE : new Result(fixed, handled);
+        }
+
+        private static Splice retypeForEachVariable(List<String> code, int index, String message) {
+            Matcher mismatch = OPERAND_MISMATCH.matcher(message);
+            if (!mismatch.find()) return null;
+            String second = mismatch.group(2);
+            if (!PRIMITIVES.contains(second)) return null;
+            String flagged = code.get(index);
+            int operator = soleEqualityOperand(flagged);
+            if (operator < 0) return null;
+            int[] left = bareIdentifierBefore(flagged, operator - 1);
+            if (left == null) return null;
+            if (bareIdentifierAfter(flagged, operator) == null) return null;
+            String ident = flagged.substring(left[0], left[1]);
+            if (countWords(flagged, ident) != 1) return null;
+            int header = enclosingForEachHeader(code, index, ident);
+            if (header < 0) return null;
+            int[] type = forEachTypeToken(code.get(header), ident);
+            if (type == null) return null;
+            if (!OBJECT_SPELLINGS.contains(code.get(header).substring(type[0], type[1]))) return null;
+            int bodyEnd = loopBodyEnd(code, header, index);
+            if (bodyEnd < 0) return null;
+            if (mentionsElsewhere(code, header, index, bodyEnd, ident)) return null;
+            if (!provablePrimitiveIterable(code, header, second)) return null;
+            return new Splice(header, type[0], type[1], second);
+        }
+
+        private static boolean mentionsElsewhere(List<String> code, int header, int flagged, int bodyEnd,
+                                                  String ident) {
+            Pattern word = Pattern.compile("(?<![\\w$.])" + Pattern.quote(ident) + "(?![\\w$])");
+            for (int i = header + 1; i <= bodyEnd; i++) {
+                if (i == flagged) continue;
+                if (word.matcher(code.get(i)).find()) return true;
+            }
+            return false;
+        }
+
+        private static boolean provablePrimitiveIterable(List<String> code, int header, String primitive) {
+            String iterable = forEachIterable(code.get(header));
+            if (iterable == null || iterable.isEmpty()) return false;
+            if (iterable.endsWith("()")) {
+                int dot = iterable.lastIndexOf('.');
+                if (dot <= 0) return false;
+                if (!DOTTED_RECEIVER.matcher(iterable.substring(0, dot)).matches()) return false;
+                Matcher call = TO_ARRAY_CALL.matcher(iterable.substring(dot + 1, iterable.length() - 2));
+                return PRIMITIVE_ARRAY_PRODUCERS.contains(primitive)
+                        && call.matches()
+                        && call.group(1).equalsIgnoreCase(primitive);
+            }
+            if (!iterable.matches("[A-Za-z_$][\\w$]*")) return false;
+            return soleArrayDeclaration(code, header, iterable, primitive);
+        }
+
+        private static boolean soleArrayDeclaration(List<String> code, int header, String name, String primitive) {
+            Pattern declaration = Pattern.compile("(?<![\\w$.])(?:final\\s+)?" + Pattern.quote(primitive)
+                    + "\\s*\\[\\s*\\]\\s+" + Pattern.quote(name) + "(?![\\w$])");
+            int found = 0;
+            for (int i = header; i >= 0; i--) {
+                if (declaration.matcher(code.get(i)).find()) found++;
+                if (METHOD_HEADER.matcher(code.get(i)).matches()) break;
+            }
+            return found == 1;
+        }
+
+        private static String forEachIterable(String code) {
+            int w = indexOfWord(code, "for", 0);
+            if (w < 0) return null;
+            int open = code.indexOf('(', w);
+            if (open < 0) return null;
+            int close = RawCastFixer.findMatchingParen(code, open);
+            if (close < 0) return null;
+            String head = code.substring(open + 1, close);
+            int colon = RawCastFixer.topLevelChar(head, ':');
+            if (colon < 0) return null;
+            return head.substring(colon + 1).trim();
+        }
+
+        private static int enclosingForEachHeader(List<String> code, int flagged, String ident) {
+            for (int i = flagged - 1; i >= 0; i--) {
+                String line = code.get(i);
+                if (METHOD_HEADER.matcher(line).matches()) return -1;
+                if (!declaresForEachVariable(line, ident)) continue;
+                if (countWords(line, "for") != 1) return -1;
+                if (redeclaredBetween(code, i, flagged, ident)) return -1;
+                if (loopBodyEnd(code, i, flagged) < 0) return -1;
+                return i;
+            }
+            return -1;
+        }
+
+        private static boolean redeclaredBetween(List<String> code, int header, int flagged, String ident) {
+            for (int i = header + 1; i < flagged; i++) {
+                String line = code.get(i);
+                if (declaresForEachVariable(line, ident)) return true;
+                if (Pattern.compile("(?<![\\w$.])(?:final\\s+)?[\\w.$<>\\[\\]]+\\s+"
+                                + Pattern.quote(ident) + "\\s*(?=[=;,\\[:)])")
+                        .matcher(line).find()) return true;
+            }
+            return false;
+        }
+
+        private static int loopBodyEnd(List<String> code, int header, int flagged) {
+            String first = code.get(header);
+            int open = first.indexOf('{');
+            if (open < 0) return -1;
+            int depth = 0;
+            for (int i = header; i <= flagged; i++) {
+                String line = code.get(i);
+                int from = i == header ? open : 0;
+                for (int j = from; j < line.length(); j++) {
+                    char c = line.charAt(j);
+                    if (c == '{') depth++;
+                    else if (c == '}') {
+                        depth--;
+                        if (depth == 0) return -1;
+                    }
+                }
+            }
+            for (int i = flagged + 1; i < code.size(); i++) {
+                for (int j = 0; j < code.get(i).length(); j++) {
+                    char c = code.get(i).charAt(j);
+                    if (c == '{') depth++;
+                    else if (c == '}') {
+                        depth--;
+                        if (depth == 0) return i;
+                    }
+                }
+            }
+            return -1;
+        }
+
+        private static boolean declaresForEachVariable(String code, String ident) {
+            for (int w = indexOfWord(code, "for", 0); w >= 0; w = indexOfWord(code, "for", w + 3)) {
+                int open = code.indexOf('(', w);
+                if (open < 0) return false;
+                int close = RawCastFixer.findMatchingParen(code, open);
+                if (close < 0) return false;
+                String head = code.substring(open + 1, close);
+                int colon = RawCastFixer.topLevelChar(head, ':');
+                if (colon < 0) continue;
+                if (declaredTypeAtEnd(code, open + 1, open + 1 + colon, ident) != null) return true;
+            }
+            return false;
+        }
+
+        private static int[] forEachTypeToken(String code, String ident) {
+            int w = indexOfWord(code, "for", 0);
+            if (w < 0) return null;
+            int open = code.indexOf('(', w);
+            if (open < 0) return null;
+            int close = RawCastFixer.findMatchingParen(code, open);
+            if (close < 0) return null;
+            String head = code.substring(open + 1, close);
+            int colon = RawCastFixer.topLevelChar(head, ':');
+            if (colon < 0) return null;
+            return declaredTypeAtEnd(code, open + 1, open + 1 + colon, ident);
+        }
+
+        private static int[] declaredTypeAtEnd(String code, int from, int to, String ident) {
+            int nameEnd = skipSpacesBackwards(code, to - 1, from);
+            if (nameEnd < from) return null;
+            if (!Character.isJavaIdentifierPart(code.charAt(nameEnd))) return null;
+            int nameStart = nameEnd;
+            while (nameStart > from && Character.isJavaIdentifierPart(code.charAt(nameStart - 1))) nameStart--;
+            if (!code.substring(nameStart, nameEnd + 1).equals(ident)) return null;
+            int typeEnd = skipSpacesBackwards(code, nameStart - 1, from);
+            if (typeEnd < from) return null;
+            int typeStart = typeEnd;
+            while (typeStart > from && isTypeChar(code.charAt(typeStart - 1))) typeStart--;
+            while (typeStart < typeEnd && isSpace(code.charAt(typeStart))) typeStart++;
+            Matcher modifier = FINAL.matcher(code);
+            modifier.region(typeStart, typeEnd + 1);
+            if (modifier.lookingAt()) typeStart = modifier.end();
+            if (typeStart > typeEnd) return null;
+            if (!Character.isJavaIdentifierStart(code.charAt(typeStart))) return null;
+            return new int[]{typeStart, typeEnd + 1};
+        }
+
+        private static boolean isTypeChar(char c) {
+            return Character.isJavaIdentifierPart(c) || c == '.' || c == '<' || c == '>'
+                    || c == '[' || c == ']' || c == ' ' || c == ',';
+        }
+
+        private static int soleEqualityOperand(String code) {
+            int best = -1;
+            int bestDepth = Integer.MAX_VALUE;
+            int ties = 0;
+            int depth = 0;
+            for (int i = 0; i + 1 < code.length(); i++) {
+                char c = code.charAt(i);
+                if (c == '(') {
+                    depth++;
+                    continue;
+                }
+                if (c == ')') {
+                    depth--;
+                    continue;
+                }
+                if (code.charAt(i + 1) != '=') continue;
+                if (c != '=' && c != '!') continue;
+                if (i > 0 && "=!<>&|".indexOf(code.charAt(i - 1)) >= 0) continue;
+                if (bareIdentifierBefore(code, i - 1) == null) continue;
+                if (bareIdentifierAfter(code, i) == null) continue;
+                if (depth < bestDepth) {
+                    bestDepth = depth;
+                    best = i;
+                    ties = 1;
+                } else if (depth == bestDepth) {
+                    ties++;
+                }
+            }
+            return ties == 1 ? best : -1;
+        }
+
+        private static int[] bareIdentifierBefore(String code, int operator) {
+            int nameEnd = skipSpacesBackwards(code, operator);
+            if (nameEnd < 0 || !Character.isJavaIdentifierPart(code.charAt(nameEnd))) return null;
+            int nameStart = nameEnd;
+            while (nameStart > 0 && Character.isJavaIdentifierPart(code.charAt(nameStart - 1))) nameStart--;
+            if (nameStart > 0) {
+                char before = code.charAt(nameStart - 1);
+                if (Character.isJavaIdentifierPart(before) || before == '.') return null;
+            }
+            if (!Character.isJavaIdentifierStart(code.charAt(nameStart))) return null;
+            return new int[]{nameStart, nameEnd + 1};
+        }
+
+        private static int[] bareIdentifierAfter(String code, int operator) {
+            int nameStart = skipSpaces(code, operator + 2, code.length());
+            if (nameStart >= code.length() || !Character.isJavaIdentifierStart(code.charAt(nameStart))) return null;
+            int nameEnd = identifierEnd(code, nameStart);
+            if (nameEnd < 0) return null;
+            if (nameEnd < code.length()) {
+                char after = code.charAt(nameEnd);
+                if (Character.isJavaIdentifierPart(after) || after == '.' || after == '[' || after == '(') return null;
+            }
+            return new int[]{nameStart, nameEnd};
+        }
+
+        private static int identifierEnd(String code, int start) {
+            int i = start;
+            while (i < code.length() && Character.isJavaIdentifierPart(code.charAt(i))) i++;
+            return i;
+        }
+
+        private static int skipSpaces(String code, int from, int limit) {
+            int i = from;
+            while (i < limit && isSpace(code.charAt(i))) i++;
+            return i;
+        }
+
+        private static int skipSpacesBackwards(String code, int from) {
+            return skipSpacesBackwards(code, from, 0);
+        }
+
+        private static int skipSpacesBackwards(String code, int from, int limit) {
+            int i = from;
+            while (i >= limit && isSpace(code.charAt(i))) i--;
+            return i;
+        }
+
+        private static boolean isSpace(char c) {
+            return c == ' ' || c == '\t';
+        }
+
+        private static int indexOfWord(String code, String word, int from) {
+            int at = from;
+            while (at >= 0) {
+                at = code.indexOf(word, at);
+                if (at < 0) return -1;
+                boolean beforeOk = at == 0 || !Character.isJavaIdentifierPart(code.charAt(at - 1));
+                int end = at + word.length();
+                boolean afterOk = end >= code.length() || !Character.isJavaIdentifierPart(code.charAt(end));
+                if (beforeOk && afterOk) return at;
+                at = at + 1;
+            }
+            return -1;
+        }
+
+        private static int countWords(String code, String word) {
+            int count = 0;
+            for (int at = indexOfWord(code, word, 0); at >= 0; at = indexOfWord(code, word, at + 1)) count++;
+            return count;
         }
     }
 

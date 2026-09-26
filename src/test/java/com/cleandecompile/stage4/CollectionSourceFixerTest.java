@@ -864,4 +864,605 @@ class CollectionSourceFixerTest {
         assertEquals(0, fix(root, outcome).fixes());
         assertEquals(before, read(root, "rs/Client.java"));
     }
+
+    private static void writeGroundMarkersSupport(Path root) throws IOException {
+        write(root, "rs/runelite/pkg819/Class781.java", """
+                package rs.runelite.pkg819;
+
+                import java.util.Collection;
+
+                public class Class781 {
+                   public static Collection method1074(int a) { return null; }
+                }
+                """);
+        write(root, "rs/plugins/groundmarkers/Class697.java", """
+                package rs.plugins.groundmarkers;
+
+                public class Class697 {
+                   public int method1506() { return 0; }
+                   public int method1180() { return 0; }
+                   public int method2238() { return 0; }
+                }
+                """);
+        write(root, "rs/plugins/groundmarkers/Class694.java", """
+                package rs.plugins.groundmarkers;
+
+                import rs.runelite.pkg819.Class781;
+
+                public class Class694 {
+                   public Class694(Class781 a, int b, int c) { }
+                }
+                """);
+    }
+
+    private static String groundMarkersSource(String declaration, String returned) {
+        return """
+                package rs.plugins.groundmarkers;
+
+                import java.util.Collection;
+                import java.util.Collections;
+                import java.util.stream.Collectors;
+                import rs.runelite.pkg819.Class781;
+
+                public class GroundMarkersPlugin {
+                   private Collection<Class694> method1212(Collection<Class697> var1) {
+                      return (Collection<Class694>) (var1.isEmpty()
+                            ? Collections.emptyList()
+                            : (Collection) var1.stream()
+                            .map(var0 -> var0)
+                            .flatMap(var0 -> {
+                               %s
+                               %s
+                            })
+                            .collect(Collectors.toList()));
+                   }
+                }
+                """.formatted(declaration, returned);
+    }
+
+    private static final String RAW_DECLARATION = "Collection var1x = Class781.method1074(var0.method1506());";
+    private static final String RETURN_WITH_CAST =
+            "return (rs.runelite.pkg819.Class781) var1x.stream()"
+                    + ".map(var1xx -> new Class694(var1xx, var0.method1180(), var0.method2238()));";
+    private static final String RETURN_WITHOUT_CAST =
+            "return var1x.stream().map(var1xx -> new Class694(var1xx, var0.method1180(), var0.method2238()));";
+
+    @Test
+    void parameterizesARawCollectionLocalSoTheStreamElementInfersTheNamedType(@TempDir Path root)
+            throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java",
+                groundMarkersSource(RAW_DECLARATION, RETURN_WITH_CAST));
+
+        var outcome = compile(root);
+        assertEquals(2, outcome.diagnostics().size(),
+                "the raw source plus the decompiler's cast must produce the pair: "
+                        + outcome.diagnostics().stream()
+                                .map(d -> d.getMessage(java.util.Locale.ENGLISH)).toList());
+        assertTrue(outcome.diagnostics().stream().anyMatch(d -> d.getMessage(java.util.Locale.ENGLISH)
+                        .contains("incompatible types: java.lang.Object cannot be converted to rs.runelite.pkg819.Class781")),
+                "the lambda parameter must infer Object: "
+                        + outcome.diagnostics().stream()
+                                .map(d -> d.getMessage(java.util.Locale.ENGLISH)).toList());
+
+        var result = fix(root, outcome);
+
+        assertEquals(1, result.fixes());
+        String updated = read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java");
+        assertTrue(updated.contains("Collection<Class781> var1x = Class781.method1074(var0.method1506());"),
+                "the imported type argument belongs on the raw local's declaration:\n" + updated);
+        assertTrue(updated.contains(RETURN_WITHOUT_CAST),
+                "the dead cast must go with it, or the same diagnostic returns:\n" + updated);
+        var after = compile(root);
+        assertTrue(after.success(),
+                "expected clean compile after parameterizing: " + after.diagnostics().stream()
+                        .map(d -> d.getMessage(java.util.Locale.ENGLISH)).toList());
+    }
+
+    @Test
+    void emitsTheFullyQualifiedTypeArgumentWhenTheFileDoesNotBindIt(@TempDir Path root) throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java", """
+                package rs.plugins.groundmarkers;
+
+                import java.util.Collection;
+                import java.util.Collections;
+                import java.util.stream.Collectors;
+
+                public class GroundMarkersPlugin {
+                   private Collection<Class694> method1212(Collection<Class697> var1) {
+                      return (Collection<Class694>) (var1.isEmpty()
+                            ? Collections.emptyList()
+                            : (Collection) var1.stream()
+                            .map(var0 -> var0)
+                            .flatMap(var0 -> {
+                               Collection var1x = rs.runelite.pkg819.Class781.method1074(var0.method1506());
+                               return var1x.stream().map(var1xx -> new Class694(var1xx, var0.method1180(), var0.method2238()));
+                            })
+                            .collect(Collectors.toList()));
+                   }
+                }
+                """);
+
+        var outcome = compile(root);
+        assertTrue(outcome.diagnostics().stream().anyMatch(d -> d.getMessage(java.util.Locale.ENGLISH)
+                        .contains("incompatible types: java.lang.Object cannot be converted to rs.runelite.pkg819.Class781")),
+                "the lambda parameter must infer Object");
+
+        var result = fix(root, outcome);
+
+        assertEquals(1, result.fixes());
+        String updated = read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java");
+        assertTrue(updated.contains("Collection<rs.runelite.pkg819.Class781> var1x = "
+                        + "rs.runelite.pkg819.Class781.method1074(var0.method1506());"),
+                "an unbound FQN must be emitted verbatim and no import added:\n" + updated);
+        assertEquals(0, updated.lines().filter(l -> l.startsWith("import ") && l.contains("pkg819")).count(),
+                "no import may be added for the fully qualified type argument:\n" + updated);
+        var after = compile(root);
+        assertTrue(after.success(), "expected clean compile after parameterizing");
+    }
+
+    @Test
+    void parameterizesTheSourceEvenWhenNoDeadCastIsPresent(@TempDir Path root) throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java",
+                groundMarkersSource(RAW_DECLARATION, RETURN_WITHOUT_CAST));
+
+        var outcome = compile(root);
+        assertEquals(1, outcome.diagnostics().size(),
+                "without the cast only the element mismatch remains: "
+                        + outcome.diagnostics().stream()
+                                .map(d -> d.getMessage(java.util.Locale.ENGLISH)).toList());
+
+        var result = fix(root, outcome);
+
+        assertEquals(1, result.fixes());
+        assertTrue(read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java")
+                .contains("Collection<Class781> var1x"), "declaration must carry the type argument");
+        var after = compile(root);
+        assertTrue(after.success(), "expected clean compile after parameterizing");
+    }
+
+    @Test
+    void bailsWhenTheStreamReceiverIsNotABareIdentifier(@TempDir Path root) throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java", """
+                package rs.plugins.groundmarkers;
+
+                import java.util.Collection;
+                import java.util.Collections;
+                import java.util.stream.Collectors;
+                import rs.runelite.pkg819.Class781;
+
+                public class GroundMarkersPlugin {
+                   Collection field1 = Class781.method1074(0);
+
+                   private Collection<Class694> method1212(Collection<Class697> var1) {
+                      return (Collection<Class694>) (var1.isEmpty()
+                            ? Collections.emptyList()
+                            : (Collection) var1.stream()
+                            .map(var0 -> var0)
+                            .flatMap(var0 -> {
+                               return field1.stream()
+                                     .map(var1xx -> new Class694(var1xx, var0.method1180(), var0.method2238()));
+                            })
+                            .collect(Collectors.toList()));
+                   }
+                }
+                """);
+        String before = read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java");
+
+        var outcome = compile(root);
+        assertTrue(outcome.diagnostics().stream().anyMatch(d -> d.getMessage(java.util.Locale.ENGLISH)
+                        .contains("incompatible types: java.lang.Object cannot be converted to rs.runelite.pkg819.Class781")),
+                "the lambda parameter must infer Object");
+
+        var result = fix(root, outcome);
+
+        assertEquals(0, result.fixes(),
+                "a field is not a method-local declaration this path may retype");
+        assertEquals(before, read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java"));
+    }
+
+    @Test
+    void bailsWhenTheIdentifierIsDeclaredTwiceInTheMethod(@TempDir Path root) throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java", """
+                package rs.plugins.groundmarkers;
+
+                import java.util.ArrayList;
+                import java.util.Collection;
+                import java.util.Collections;
+                import java.util.stream.Collectors;
+                import rs.runelite.pkg819.Class781;
+
+                public class GroundMarkersPlugin {
+                   private Collection<Class694> method1212(Collection<Class697> var1, int mode) {
+                      Collection var1x = new ArrayList();
+                      if (mode > 0) {
+                         var1x = Class781.method1074(0);
+                      }
+                      return (Collection<Class694>) (var1.isEmpty()
+                            ? Collections.emptyList()
+                            : (Collection) var1.stream()
+                            .map(var0 -> var0)
+                            .flatMap(var0 -> {
+                               return var1x.stream()
+                                     .map(var1xx -> new Class694(var1xx, var0.method1180(), var0.method2238()));
+                            })
+                            .collect(Collectors.toList()));
+                   }
+                }
+                """);
+        String before = read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java");
+
+        var outcome = compile(root);
+        assertTrue(outcome.diagnostics().stream().anyMatch(d -> d.getMessage(java.util.Locale.ENGLISH)
+                        .contains("incompatible types: java.lang.Object cannot be converted to rs.runelite.pkg819.Class781")),
+                "the lambda parameter must infer Object");
+
+        var result = fix(root, outcome);
+
+        assertEquals(0, result.fixes(), "two declarations make the type argument ambiguous");
+        assertEquals(before, read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java"));
+    }
+
+    @Test
+    void bailsWhenTheDeclarationIsInAnotherMethod(@TempDir Path root) throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java", """
+                package rs.plugins.groundmarkers;
+
+                import java.util.Collection;
+                import java.util.Collections;
+                import java.util.stream.Collectors;
+                import rs.runelite.pkg819.Class781;
+
+                public class GroundMarkersPlugin {
+                   private void other() {
+                      Collection var1x = Class781.method1074(0);
+                      System.out.println(var1x);
+                   }
+
+                   private Collection<Class694> method1212(Collection<Class697> var1, Collection var1x) {
+                      return (Collection<Class694>) (var1.isEmpty()
+                            ? Collections.emptyList()
+                            : (Collection) var1.stream()
+                            .map(var0 -> var0)
+                            .flatMap(var0 -> {
+                               return var1x.stream()
+                                     .map(var1xx -> new Class694(var1xx, var0.method1180(), var0.method2238()));
+                            })
+                            .collect(Collectors.toList()));
+                   }
+                }
+                """);
+        String before = read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java");
+
+        var outcome = compile(root);
+        assertTrue(outcome.diagnostics().stream().anyMatch(d -> d.getMessage(java.util.Locale.ENGLISH)
+                        .contains("incompatible types: java.lang.Object cannot be converted to rs.runelite.pkg819.Class781")),
+                "the lambda parameter must infer Object");
+
+        var result = fix(root, outcome);
+
+        assertEquals(0, result.fixes(), "the only local declaration lives in a different method");
+        assertEquals(before, read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java"));
+    }
+
+    @Test
+    void bailsWhenTheFlaggedLineCarriesTwoStreamCalls(@TempDir Path root) throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java", """
+                package rs.plugins.groundmarkers;
+
+                import java.util.Collection;
+                import java.util.Collections;
+                import java.util.stream.Collectors;
+                import rs.runelite.pkg819.Class781;
+
+                public class GroundMarkersPlugin {
+                   private Collection<Class694> method1212(Collection<Class697> var1) {
+                      Collection var1x = Class781.method1074(0);
+                      Collection var1y = Class781.method1074(1);
+                      return (Collection<Class694>) (var1.isEmpty()
+                            ? Collections.emptyList()
+                            : (Collection) var1.stream()
+                            .map(var0 -> var0)
+                            .flatMap(var0 -> {
+                               return var1x.stream().map(var1xx -> var1y.stream().count() == 0L
+                                     ? new Class694(var1xx, var0.method1180(), var0.method2238())
+                                     : null);
+                            })
+                            .collect(Collectors.toList()));
+                   }
+                }
+                """);
+        String before = read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java");
+
+        var outcome = compile(root);
+        assertTrue(outcome.diagnostics().stream().anyMatch(d -> d.getMessage(java.util.Locale.ENGLISH)
+                        .contains("incompatible types: java.lang.Object cannot be converted to rs.runelite.pkg819.Class781")),
+                "the lambda parameter must infer Object");
+
+        var result = fix(root, outcome);
+
+        assertEquals(0, result.fixes(), "two stream sources on the line make the receiver ambiguous");
+        assertEquals(before, read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java"));
+    }
+
+    @Test
+    void reRunningWithTheOriginalDiagnosticsYieldsNoFurtherParameterization(@TempDir Path root)
+            throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java",
+                groundMarkersSource(RAW_DECLARATION, RETURN_WITH_CAST));
+
+        var diagnostics = bucketer.categorize(compile(root).diagnostics());
+        assertEquals(1, CompileFixLoop.CollectionSourceFixer.tryFixAll(root, diagnostics).fixes());
+        String afterFirst = read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java");
+
+        var repeated = CompileFixLoop.CollectionSourceFixer.tryFixAll(root, diagnostics);
+
+        assertEquals(0, repeated.fixes(),
+                "the declaration is parameterized now, so the same list must find nothing left to do");
+        assertEquals(afterFirst, read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java"));
+    }
+
+    @Test
+    void rawCastFixerAddsNoCastAfterParameterizingTheSource(@TempDir Path root) throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java",
+                groundMarkersSource(RAW_DECLARATION, RETURN_WITH_CAST));
+
+        var outcome = compile(root);
+        var diagnostics = bucketer.categorize(outcome.diagnostics());
+
+        var result = CompileFixLoop.CollectionSourceFixer.tryFixAll(root, diagnostics);
+        assertEquals(1, result.fixes());
+
+        var remaining = result.unhandled(diagnostics);
+        int castFixes = CompileFixLoop.RawCastFixer.tryFixAll(root, remaining);
+
+        assertEquals(0, castFixes,
+                "the cast must not come back, or the line flip-flops forever");
+        String updated = read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java");
+        assertTrue(updated.contains(RETURN_WITHOUT_CAST), "no cast may remain:\n" + updated);
+        assertTrue(compile(root).success(), "expected clean compile after parameterizing");
+    }
+
+    @Test
+    void unhandledWithholdsOnlyTheParameterizationDiagnostic(@TempDir Path root) throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java",
+                groundMarkersSource(RAW_DECLARATION, RETURN_WITHOUT_CAST));
+        write(root, "rs/plugins/groundmarkers/Missing1.java", """
+                package rs.plugins.groundmarkers;
+
+                public class Missing1 {
+                   Missing value;
+                }
+                """);
+
+        var outcome = compile(root);
+        var diagnostics = bucketer.categorize(outcome.diagnostics());
+        var result = fix(root, outcome);
+        var remaining = result.unhandled(diagnostics);
+
+        assertEquals(1, result.fixes());
+        assertEquals(1, result.handled().size());
+        assertEquals(1, remaining.size(), "the missing-class diagnostic survives for ImportInserter");
+        assertTrue(remaining.get(0).diagnostic().getMessage(java.util.Locale.ENGLISH).contains("class Missing"),
+                remaining.get(0).diagnostic().getMessage(java.util.Locale.ENGLISH));
+    }
+
+    @Test
+    void bailsWhenTheMethodHeaderIsSplitAndAPreviousMethodSharesTheLocalName(@TempDir Path root)
+            throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java", """
+                package rs.plugins.groundmarkers;
+
+                import java.util.Collection;
+                import java.util.Collections;
+                import java.util.stream.Collectors;
+                import rs.runelite.pkg819.Class781;
+
+                public class GroundMarkersPlugin {
+                   private void other() {
+                      Collection var1x = Class781.method1074(0);
+                      System.out.println(var1x);
+                   }
+
+                   private Collection<Class694> method1212(
+                         Collection<Class697> var1, Collection var1x) {
+                      return (Collection<Class694>) (var1.isEmpty()
+                            ? Collections.emptyList()
+                            : (Collection) var1.stream()
+                            .map(var0 -> var0)
+                            .flatMap(var0 -> {
+                               return var1x.stream().map(var1xx -> new Class694(var1xx, var0.method1180(), var0.method2238()));
+                            })
+                            .collect(Collectors.toList()));
+                   }
+                }
+                """);
+        String before = read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java");
+
+        var outcome = compile(root);
+        assertTrue(outcome.diagnostics().stream().anyMatch(d -> d.getMessage(java.util.Locale.ENGLISH)
+                        .contains("incompatible types: java.lang.Object cannot be converted to rs.runelite.pkg819.Class781")),
+                "the lambda parameter must infer Object: "
+                        + outcome.diagnostics().stream()
+                                .map(d -> d.getMessage(java.util.Locale.ENGLISH)).toList());
+
+        var result = fix(root, outcome);
+
+        assertEquals(0, result.fixes(),
+                "the class-level brace-depth backstop must stop the scan before the previous method's"
+                        + " same-named local, whether or not the signature line is recognisable");
+        assertEquals(before, read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java"));
+    }
+
+    @Test
+    void theOnlyEscapeFromAPreviousMethodIsTheBraceDepthBackstop(@TempDir Path root) throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java", """
+                package rs.plugins.groundmarkers;
+
+                import java.util.Collection;
+                import java.util.Collections;
+                import java.util.stream.Collectors;
+                import rs.runelite.pkg819.Class781;
+
+                public class GroundMarkersPlugin {
+                   private Collection var1x;
+
+                   private void other() { Collection var1x = Class781.method1074(0); }
+
+                   private Collection<Class694> method1212(
+                         Collection<Class697> var1) {
+                      return (Collection<Class694>) (var1.isEmpty()
+                            ? Collections.emptyList()
+                            : (Collection) var1.stream()
+                            .map(var0 -> var0)
+                            .flatMap(var0 -> {
+                               return var1x.stream().map(var1xx -> new Class694(var1xx, var0.method1180(), var0.method2238()));
+                            })
+                            .collect(Collectors.toList()));
+                   }
+                }
+                """);
+        String before = read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java");
+
+        var outcome = compile(root);
+        assertTrue(outcome.diagnostics().stream().anyMatch(d -> d.getMessage(java.util.Locale.ENGLISH)
+                        .contains("incompatible types: java.lang.Object cannot be converted to rs.runelite.pkg819.Class781")),
+                "the lambda parameter must infer Object: "
+                        + outcome.diagnostics().stream()
+                                .map(d -> d.getMessage(java.util.Locale.ENGLISH)).toList());
+
+        var result = fix(root, outcome);
+
+        assertEquals(0, result.fixes(),
+                "the decoy local has exactly one use and no name collision, so only brace depth stops the scan");
+        assertEquals(before, read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java"));
+    }
+
+    @Test
+    void theOnlyEscapeFromAFieldInitializerIsTheBraceDepthBackstop(@TempDir Path root) throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java", """
+                package rs.plugins.groundmarkers;
+
+                import java.util.Collection;
+                import java.util.Collections;
+                import java.util.stream.Collectors;
+                import rs.runelite.pkg819.Class781;
+
+                public class GroundMarkersPlugin {
+                   private Collection var1x = Class781.method1074(0);
+
+                   private Collection<Class694> method1212(
+                         Collection<Class697> var1) {
+                      return (Collection<Class694>) (var1.isEmpty()
+                            ? Collections.emptyList()
+                            : (Collection) var1.stream()
+                            .map(var0 -> var0)
+                            .flatMap(var0 -> {
+                               return var1x.stream().map(var1xx -> new Class694(var1xx, var0.method1180(), var0.method2238()));
+                            })
+                            .collect(Collectors.toList()));
+                   }
+                }
+                """);
+        String before = read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java");
+
+        var outcome = compile(root);
+        assertEquals(1, outcome.diagnostics().size(),
+                "only the lambda parameter mismatch is expected: "
+                        + outcome.diagnostics().stream()
+                                .map(d -> d.getMessage(java.util.Locale.ENGLISH)).toList());
+
+        var result = fix(root, outcome);
+
+        assertEquals(0, result.fixes(),
+                "the field initializer has a single use, at the flagged line, so only the class-level"
+                        + " brace-depth backstop separates it from a method-local declaration");
+        assertEquals(before, read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java"));
+    }
+
+    @Test
+    void bailsWhenTheSourceLocalIsUsedAgainAfterTheFlaggedLine(@TempDir Path root) throws IOException {
+        writeGroundMarkersSupport(root);
+        write(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java", """
+                package rs.plugins.groundmarkers;
+
+                import java.util.Collection;
+                import java.util.Collections;
+                import java.util.stream.Collectors;
+                import rs.runelite.pkg819.Class781;
+
+                public class GroundMarkersPlugin {
+                   private Collection<Class694> method1212(Collection<Class697> var1) {
+                      return (Collection<Class694>) (var1.isEmpty()
+                            ? Collections.emptyList()
+                            : (Collection) var1.stream()
+                            .map(var0 -> var0)
+                            .flatMap(var0 -> {
+                               Collection var1x = Class781.method1074(var0.method1506());
+                               var1x.add(new Class694(Class781.method3068(), 1, 2));
+                               return var1x.stream()
+                                     .map(var1xx -> new Class694(var1xx, var0.method1180(), var0.method2238()));
+                            })
+                            .collect(Collectors.toList()));
+                   }
+                }
+                """);
+        String before = read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java");
+
+        var outcome = compile(root);
+        assertTrue(outcome.diagnostics().stream().anyMatch(d -> d.getMessage(java.util.Locale.ENGLISH)
+                        .contains("incompatible types: java.lang.Object cannot be converted to rs.runelite.pkg819.Class781")),
+                "the lambda parameter must infer Object");
+
+        var result = fix(root, outcome);
+
+        assertEquals(0, result.fixes(), "a second use needs the declared raw element type");
+        assertEquals(before, read(root, "rs/plugins/groundmarkers/GroundMarkersPlugin.java"));
+    }
+
+    @Test
+    void bailsWhenTheNamedTypeIsItselfParameterized(@TempDir Path root) throws IOException {
+        write(root, "rs/Generic.java", """
+                package rs;
+
+                import java.util.List;
+                import java.util.stream.Collectors;
+
+                public class Generic {
+                   public static class Holder {
+                      public Holder(List<String> value) { }
+                   }
+
+                   public List<Holder> method1(List source) {
+                      return source.stream().map(var1xx -> new Holder(var1xx)).collect(Collectors.toList());
+                   }
+                }
+                """);
+        String before = read(root, "rs/Generic.java");
+
+        var outcome = compile(root);
+        assertTrue(outcome.diagnostics().stream().anyMatch(d -> d.getMessage(java.util.Locale.ENGLISH)
+                        .contains("incompatible types: java.lang.Object cannot be converted to java.util.List<java.lang.String>")),
+                "the fixture must name a parameterized type: "
+                        + outcome.diagnostics().stream()
+                                .map(d -> d.getMessage(java.util.Locale.ENGLISH)).toList());
+
+        var result = fix(root, outcome);
+
+        assertEquals(0, result.fixes(),
+                "a truncated capture would build Collection<java.util.List> and lose the type argument");
+        assertEquals(before, read(root, "rs/Generic.java"));
+    }
 }
