@@ -354,6 +354,12 @@ public final class CompileFixLoop {
         fixes += collectionFixes;
         bucketed = collectionFix.unhandled(bucketed);
 
+        ResidualSyntaxFixer.Result residualSyntaxFix =
+                ResidualSyntaxFixer.tryFixAll(sourceRoot, bucketed);
+        int residualSyntaxFixes = residualSyntaxFix.fixes();
+        fixes += residualSyntaxFixes;
+        bucketed = residualSyntaxFix.unhandled(bucketed);
+
         DuplicateLocalFixer.Result duplicateFix =
                 DuplicateLocalFixer.tryFixAll(sourceRoot, bucketed);
         int duplicateFixes = duplicateFix.fixes();
@@ -412,15 +418,17 @@ public final class CompileFixLoop {
         int receiverFixes = ReceiverCastFixer.tryFixAll(sourceRoot, bucketed);
         fixes += receiverFixes;
 
-        // A lone throwing call in a throws-less method is wrapped in
-        // try/catch. Runs LAST: it inserts lines, which would shift the line
-        // numbers the fixers above read from this round's diagnostics.
         int wrapFixes = CheckedWrapFixer.tryFixAll(sourceRoot, bucketed);
         fixes += wrapFixes;
 
+        VoidAbstractStubFixer.Result voidAbstractFix =
+                VoidAbstractStubFixer.tryFixAll(sourceRoot, bucketed);
+        int voidAbstractFixes = voidAbstractFix.fixes();
+        fixes += voidAbstractFixes;
+
         if (fixes > 0) {
-            System.out.printf("  fixes applied: diamond=%d arrayRetype=%d split=%d objectTyped=%d lambdaRestore=%d memberResolution=%d collectionSource=%d duplicateLocal=%d residualAccess=%d imports=%d concat=%d casts=%d artifacts=%d compare=%d widen=%d receiver=%d wrap=%d%n",
-                    diamondFixes, arrayFixes, splitFixes, objectFixes, lambdaFixes, memberFixes, collectionFixes, duplicateFixes, residualFixes, importFixes, concatFixes, castFixes, artifactFixes, compareFixes, widenFixes, receiverFixes, wrapFixes);
+            System.out.printf("  fixes applied: diamond=%d arrayRetype=%d split=%d objectTyped=%d lambdaRestore=%d memberResolution=%d collectionSource=%d residualSyntax=%d duplicateLocal=%d residualAccess=%d imports=%d concat=%d casts=%d artifacts=%d compare=%d widen=%d receiver=%d wrap=%d voidAbstractStub=%d%n",
+                    diamondFixes, arrayFixes, splitFixes, objectFixes, lambdaFixes, memberFixes, collectionFixes, residualSyntaxFixes, duplicateFixes, residualFixes, importFixes, concatFixes, castFixes, artifactFixes, compareFixes, widenFixes, receiverFixes, wrapFixes, voidAbstractFixes);
         }
 
         // TODO: DUPLICATE_METHOD -- remove the redundant bridge method
@@ -2422,9 +2430,6 @@ public final class CompileFixLoop {
      * returning a fallback). Only the exception javac names, only the
      * innermost enclosing method, only when no {@code throws} names it
      * already. The import is added when missing.
-     *
-     * <p>Runs LAST among the fixers: it inserts lines, which shifts line
-     * numbers other line-scoped fixers read from this round's diagnostics.
      * Idempotent (a wrapped call no longer errors).
      */
     static final class CheckedWrapFixer {
@@ -3973,6 +3978,445 @@ public final class CompileFixLoop {
             }
             if (copied == 0) return line;
             return rewritten.append(line, copied, line.length()).toString();
+        }
+    }
+
+    static final class ResidualSyntaxFixer {
+        private static final Pattern LOSSY_CONVERSION = Pattern.compile(
+                "incompatible types: possible lossy conversion from [\\w.$]+ to (byte|short|char)");
+        private static final Pattern ASSIGNMENT_TARGET = Pattern.compile(
+                "[\\w.$]+(?:\\s*\\[[^\\[\\]]*])*");
+        private static final Pattern LEADING_CAST = Pattern.compile(
+                "^\\(\\s*[\\w.$]+(?:\\s*<[^<>]*>)?(?:\\s*\\[\\s*])*\\s*\\)");
+        private static final String COMPOUND_TAIL = "=!<>+-*/%&|^";
+
+        record Result(int fixes, List<Diagnostic<? extends JavaFileObject>> handled) {
+            List<DiagnosticBucketer.Bucketed> unhandled(List<DiagnosticBucketer.Bucketed> all) {
+                if (handled.isEmpty()) return all;
+                return all.stream().filter(b -> !handled.contains(b.diagnostic())).toList();
+            }
+
+            static final Result NONE = new Result(0, List.of());
+        }
+
+        private ResidualSyntaxFixer() {
+        }
+
+        static Result tryFixAll(Path sourceRoot, List<DiagnosticBucketer.Bucketed> bucketed) throws IOException {
+            Map<Path, List<DiagnosticBucketer.Bucketed>> byFile = new LinkedHashMap<>();
+            for (var b : bucketed) {
+                if (b.diagnostic().getSource() == null) continue;
+                Path file;
+                try {
+                    file = Path.of(b.diagnostic().getSource().toUri()).toAbsolutePath().normalize();
+                } catch (RuntimeException e) {
+                    continue;
+                }
+                if (!file.startsWith(sourceRoot.toAbsolutePath().normalize())) continue;
+                byFile.computeIfAbsent(file, f -> new ArrayList<>()).add(b);
+            }
+            int fixed = 0;
+            List<Diagnostic<? extends JavaFileObject>> handled = new ArrayList<>();
+            for (var entry : byFile.entrySet()) {
+                List<String> lines;
+                try {
+                    lines = new ArrayList<>(Files.readAllLines(entry.getKey()));
+                } catch (IOException ioe) {
+                    continue;
+                }
+                List<String> code = LambdaRestoreFixer.lexicalLines(lines);
+                Set<String> seen = new HashSet<>();
+                boolean changed = false;
+                for (var b : entry.getValue()) {
+                    String message = b.diagnostic().getMessage(Locale.ENGLISH);
+                    long lineNo = b.diagnostic().getLineNumber();
+                    if (lineNo < 1 || lineNo > lines.size()) continue;
+                    if (!seen.add(lineNo + "|" + message)) continue;
+                    int index = (int) lineNo - 1;
+                    String rewritten = rewrite(lines.get(index), code.get(index), message);
+                    if (rewritten == null) continue;
+                    lines.set(index, rewritten);
+                    code = LambdaRestoreFixer.lexicalLines(lines);
+                    changed = true;
+                    fixed++;
+                    handled.add(b.diagnostic());
+                }
+                if (changed) Files.write(entry.getKey(), lines);
+            }
+            return fixed == 0 ? Result.NONE : new Result(fixed, handled);
+        }
+
+        private static String rewrite(String line, String code, String message) {
+            Matcher lossy = LOSSY_CONVERSION.matcher(message);
+            if (lossy.find()) return narrow(line, code, lossy.group(1));
+            return null;
+        }
+
+        private static String narrow(String line, String code, String type) {
+            int equals = lastTopLevelEquals(code);
+            if (equals < 0) return null;
+            if (equals > 0 && COMPOUND_TAIL.indexOf(code.charAt(equals - 1)) >= 0) return null;
+            if (!code.trim().endsWith(";")) return null;
+            if (!ASSIGNMENT_TARGET.matcher(code.substring(0, equals).trim()).matches()) return null;
+            int start = equals + 1;
+            while (start < line.length() && line.charAt(start) == ' ') start++;
+            if (start >= line.length()) return null;
+            if (LEADING_CAST.matcher(code.substring(start)).find()) return null;
+            int end = code.length();
+            while (end > start && Character.isWhitespace(code.charAt(end - 1))) end--;
+            if (end <= start || code.charAt(end - 1) != ';') return null;
+            end--;
+            while (end > start && code.charAt(end - 1) == ' ') end--;
+            if (end <= start) return null;
+            String right = fullyWrapped(code, start, end) ? line.substring(start, end)
+                    : "(" + line.substring(start, end) + ")";
+            return line.substring(0, start) + "(" + type + ") " + right + line.substring(end);
+        }
+
+        private static boolean fullyWrapped(String code, int start, int end) {
+            if (code.charAt(start) != '(') return false;
+            int depth = 0;
+            for (int i = start; i < end; i++) {
+                char c = code.charAt(i);
+                if (c == '(') depth++;
+                else if (c == ')') {
+                    depth--;
+                    if (depth == 0) return i == end - 1;
+                }
+            }
+            return false;
+        }
+    }
+
+    static final class VoidAbstractStubFixer {
+        private static final Pattern MISSING_OVERRIDE = Pattern.compile(
+                "^(?:[\\w.$]+\\.)?(\\w+) is not abstract and does not override abstract method "
+                        + "(\\w+)\\(([^)]*)\\) in ((?:[\\w.$]+\\.)?[\\w$]+);?$");
+        private static final Pattern CLASS_DECLARATION = Pattern.compile(
+                "^\\s*(?:(?:public|protected|private|static|final|abstract|strictfp)\\s+)*class\\s+(\\w+)\\b");
+        private static final Pattern EXTENDS_CLAUSE = Pattern.compile(
+                "\\bextends\\s+(?:[\\w.$]+\\.)?(\\w+)\\b");
+        private static final Pattern ABSTRACT_METHOD = Pattern.compile(
+                "^\\s*(?:(?:public|protected|private|static|final)\\s+)*abstract\\s+"
+                        + "([\\w.$<>\\[\\]]+)\\s+(\\w+)\\s*\\(([^)]*)\\)\\s*(?:throws\\s+[\\w., $]+)?;\\s*$");
+        private static final Pattern MEMBER_DECLARATION = Pattern.compile(
+                "^\\s*(?:(?:public|protected|private|static|final|synchronized|abstract|native"
+                        + "|transient|volatile|strictfp)\\s+)*[\\w.$<>\\[\\]]+\\s+\\w+\\s*[;(=(]");
+        private static final Pattern TYPE_DECLARATION = Pattern.compile(
+                "\\b(?:class|interface|enum|record)\\s+(\\w+)\\b");
+        private static final Set<String> PRIMITIVES = Set.of(
+                "boolean", "byte", "char", "short", "int", "long", "float", "double");
+        private static final Set<String> JAVA_LANG = Set.of(
+                "Object", "String", "Integer", "Long", "Double", "Float", "Short", "Byte",
+                "Character", "Boolean", "Number", "CharSequence", "Comparable",
+                "Iterable", "Runnable", "Thread", "Throwable", "Exception", "RuntimeException",
+                "Error", "Class", "Void", "Math", "System", "StringBuilder", "StringBuffer",
+                "Appendable", "AutoCloseable", "Cloneable", "Serializable", "Enum", "Record",
+                "Override", "IllegalArgumentException", "IllegalStateException",
+                "CloneNotSupportedException", "NullPointerException", "NumberFormatException",
+                "UnsupportedOperationException", "IndexOutOfBoundsException",
+                "InterruptedException", "NoSuchFieldException", "NoSuchMethodException",
+                "SecurityException", "StackOverflowError", "AssertionError", "OutOfMemoryError");
+
+        record Result(int fixes, List<Diagnostic<? extends JavaFileObject>> handled) {
+            List<DiagnosticBucketer.Bucketed> unhandled(List<DiagnosticBucketer.Bucketed> all) {
+                if (handled.isEmpty()) return all;
+                return all.stream().filter(b -> !handled.contains(b.diagnostic())).toList();
+            }
+
+            static final Result NONE = new Result(0, List.of());
+        }
+
+        private record Insertion(int at, List<String> stub) {}
+
+        private VoidAbstractStubFixer() {
+        }
+
+        static Result tryFixAll(Path sourceRoot, List<DiagnosticBucketer.Bucketed> bucketed) throws IOException {
+            Map<Path, List<DiagnosticBucketer.Bucketed>> byFile = new LinkedHashMap<>();
+            for (var b : bucketed) {
+                if (b.diagnostic().getSource() == null) continue;
+                Path file;
+                try {
+                    file = Path.of(b.diagnostic().getSource().toUri()).toAbsolutePath().normalize();
+                } catch (RuntimeException e) {
+                    continue;
+                }
+                if (!file.startsWith(sourceRoot.toAbsolutePath().normalize())) continue;
+                byFile.computeIfAbsent(file, f -> new ArrayList<>()).add(b);
+            }
+            int fixed = 0;
+            List<Diagnostic<? extends JavaFileObject>> handled = new ArrayList<>();
+            for (var entry : byFile.entrySet()) {
+                List<String> lines;
+                try {
+                    lines = new ArrayList<>(Files.readAllLines(entry.getKey()));
+                } catch (IOException ioe) {
+                    continue;
+                }
+                List<String> code = LambdaRestoreFixer.lexicalLines(lines);
+                Set<String> seen = new HashSet<>();
+                boolean changed = false;
+                for (var b : entry.getValue()) {
+                    Matcher m = MISSING_OVERRIDE.matcher(b.diagnostic().getMessage(Locale.ENGLISH).strip());
+                    if (!m.matches()) continue;
+                    if (!seen.add(m.group(1) + "/" + m.group(2) + "/" + m.group(3))) continue;
+                    Insertion insertion;
+                    try {
+                        insertion = insertion(lines, code, sourceRoot, entry.getKey(), m);
+                    } catch (IOException ioe) {
+                        continue;
+                    }
+                    if (insertion == null) continue;
+                    lines.addAll(insertion.at(), insertion.stub());
+                    code = LambdaRestoreFixer.lexicalLines(lines);
+                    changed = true;
+                    fixed++;
+                    handled.add(b.diagnostic());
+                }
+                if (changed) Files.write(entry.getKey(), lines);
+            }
+            return fixed == 0 ? Result.NONE : new Result(fixed, handled);
+        }
+
+        private static Insertion insertion(List<String> lines, List<String> code, Path sourceRoot,
+                                           Path file, Matcher m) throws IOException {
+            String owner = m.group(4);
+            int declaration = classDeclaration(code, m.group(1));
+            if (declaration < 0) return null;
+            Matcher extendsClause = EXTENDS_CLAUSE.matcher(code.get(declaration));
+            if (!extendsClause.find() || !extendsClause.group(1).equals(simpleName(owner))) return null;
+            int close = classBodyEnd(code, declaration);
+            if (close < 0) return null;
+            if (declaresMethod(code, declaration, close, m.group(2))) return null;
+            String parameters = abstractParameters(sourceRoot, file, owner, m.group(2),
+                    paramCount(m.group(3)));
+            if (parameters == null) return null;
+            if (!typesVisible(sourceRoot, file, code, owner, parameters)) return null;
+            String indent = memberIndent(code, declaration, close);
+            return new Insertion(close, List.of(
+                    indent + "@Override",
+                    indent + "public void " + m.group(2) + "(" + parameters + ") {",
+                    indent + "}"));
+        }
+
+        private static int classDeclaration(List<String> code, String typeName) {
+            for (int i = 0; i < code.size(); i++) {
+                Matcher m = CLASS_DECLARATION.matcher(code.get(i));
+                if (m.find() && m.group(1).equals(typeName)) return i;
+            }
+            return -1;
+        }
+
+        private static int classBodyEnd(List<String> code, int declaration) {
+            int depth = 0;
+            boolean opened = false;
+            for (int i = declaration; i < code.size(); i++) {
+                String line = code.get(i);
+                for (int j = 0; j < line.length(); j++) {
+                    char c = line.charAt(j);
+                    if (c == '{') {
+                        opened = true;
+                        depth++;
+                    } else if (c == '}' && --depth == 0 && opened) {
+                        return i;
+                    }
+                }
+            }
+            return -1;
+        }
+
+        private static boolean declaresMethod(List<String> code, int declaration, int close, String name) {
+            for (int i = declaration; i <= close; i++) {
+                String line = code.get(i);
+                int from = 0;
+                while (true) {
+                    int at = line.indexOf(name, from);
+                    if (at < 0) break;
+                    from = at + name.length();
+                    if (at > 0 && Character.isJavaIdentifierPart(line.charAt(at - 1))) continue;
+                    if (at + name.length() < line.length() && line.charAt(at + name.length()) == '(') return true;
+                }
+            }
+            return false;
+        }
+
+        private static String abstractParameters(Path sourceRoot, Path file, String ownerName,
+                                                String methodName, int arity) throws IOException {
+            Path ownerFile = ownerSource(sourceRoot, file, ownerName);
+            if (ownerFile == null) return null;
+            for (String line : Files.readAllLines(ownerFile)) {
+                Matcher m = ABSTRACT_METHOD.matcher(line);
+                if (!m.matches() || !m.group(2).equals(methodName)) continue;
+                if (paramCount(m.group(3)) != arity) continue;
+                if (!"void".equals(m.group(1))) return null;
+                return m.group(3).strip();
+            }
+            return null;
+        }
+
+        private static boolean typesVisible(Path sourceRoot, Path file, List<String> code,
+                                            String ownerName, String parameters) throws IOException {
+            Path ownerFile = ownerSource(sourceRoot, file, ownerName);
+            if (ownerFile == null) return false;
+            if (ownerFile.toAbsolutePath().normalize().getParent()
+                    .equals(file.toAbsolutePath().normalize().getParent())) return true;
+            Set<String> visible = new HashSet<>(scopeOf(code));
+            if (extendsType(code, simpleName(ownerName))) {
+                for (String line : LambdaRestoreFixer.lexicalLines(Files.readAllLines(ownerFile))) {
+                    Matcher declared = TYPE_DECLARATION.matcher(line.strip());
+                    if (declared.find()) visible.add(declared.group(1));
+                }
+            }
+            for (String type : unqualifiedTypeNames(parameters)) {
+                if (JAVA_LANG.contains(type) || visible.contains(type)) continue;
+                if (Files.isRegularFile(file.resolveSibling(type + ".java"))) continue;
+                return false;
+            }
+            return true;
+        }
+
+        private static Set<String> scopeOf(List<String> lines) {
+            Set<String> names = new HashSet<>();
+            for (String raw : lines) {
+                String line = raw.strip();
+                if (line.startsWith("import ")) {
+                    String spelled = line.substring("import ".length()).replace(";", "").strip();
+                    if (spelled.startsWith("static ")) spelled = spelled.substring("static ".length()).strip();
+                    if (!spelled.endsWith(".*")) names.add(simpleName(spelled));
+                } else {
+                    Matcher declared = TYPE_DECLARATION.matcher(line);
+                    if (declared.find()) names.add(declared.group(1));
+                }
+            }
+            return names;
+        }
+
+        private static boolean extendsType(List<String> lines, String typeName) {
+            for (String line : lines) {
+                Matcher m = EXTENDS_CLAUSE.matcher(line);
+                if (m.find() && m.group(1).equals(typeName)) return true;
+            }
+            return false;
+        }
+
+        private static List<String> unqualifiedTypeNames(String parameters) {
+            List<String> names = new ArrayList<>();
+            for (String parameter : splitTopLevel(parameters)) {
+                String type = parameterType(parameter);
+                if (type.isEmpty()) continue;
+                String name = unqualifiedTypeName(type);
+                if (name == null || PRIMITIVES.contains(name)) continue;
+                names.add(name);
+            }
+            return names;
+        }
+
+        private static String parameterType(String parameter) {
+            String text = parameter.strip();
+            while (true) {
+                if (text.startsWith("final ")) {
+                    text = text.substring("final ".length()).strip();
+                    continue;
+                }
+                if (text.startsWith("@")) {
+                    int space = text.indexOf(' ');
+                    if (space < 0) return "";
+                    text = text.substring(space + 1).strip();
+                    continue;
+                }
+                break;
+            }
+            for (int i = text.length() - 1; i >= 0; i--) {
+                if (Character.isWhitespace(text.charAt(i))) return text.substring(0, i).strip();
+            }
+            return text;
+        }
+
+        private static String unqualifiedTypeName(String type) {
+            String text = type.replace("...", "[]");
+            int open = text.indexOf('<');
+            if (open >= 0) {
+                int close = matchingAngle(text, open);
+                if (close < 0) return null;
+                text = text.substring(0, open) + text.substring(close + 1);
+            }
+            text = text.replaceAll("\\s*\\[\\s*]", "").strip();
+            if (text.isEmpty() || text.indexOf('.') >= 0) return null;
+            return text;
+        }
+
+        private static int matchingAngle(String text, int open) {
+            int depth = 0;
+            for (int i = open; i < text.length(); i++) {
+                char c = text.charAt(i);
+                if (c == '<') depth++;
+                else if (c == '>' && --depth == 0) return i;
+            }
+            return -1;
+        }
+
+        private static String simpleName(String spelled) {
+            int dot = spelled.lastIndexOf('.');
+            return dot < 0 ? spelled : spelled.substring(dot + 1);
+        }
+
+        private static Path ownerSource(Path sourceRoot, Path file, String ownerName) throws IOException {
+            if (ownerName.contains(".")) {
+                Path named = sourceRoot.resolve(Path.of(ownerName.replace('.', '/') + ".java"));
+                return Files.isRegularFile(named) ? named : null;
+            }
+            Path sibling = file.resolveSibling(ownerName + ".java");
+            if (Files.isRegularFile(sibling)) return sibling;
+            List<Path> candidates = new ArrayList<>();
+            try (Stream<Path> walk = Files.walk(sourceRoot)) {
+                for (Path p : (Iterable<Path>) walk
+                        .filter(f -> f.getFileName().toString().equals(ownerName + ".java"))::iterator) {
+                    candidates.add(p);
+                }
+            }
+            return candidates.size() == 1 ? candidates.get(0) : null;
+        }
+
+        private static int paramCount(String parameters) {
+            return splitTopLevel(parameters).size();
+        }
+
+        private static List<String> splitTopLevel(String parameters) {
+            List<String> parts = new ArrayList<>();
+            String code = parameters.strip();
+            if (code.isEmpty()) return parts;
+            int depth = 0;
+            int start = 0;
+            for (int i = 0; i < code.length(); i++) {
+                char c = code.charAt(i);
+                if (c == '(' || c == '[' || c == '<') depth++;
+                else if (c == ')' || c == ']' || c == '>') depth--;
+                else if (c == ',' && depth == 0) {
+                    parts.add(code.substring(start, i));
+                    start = i + 1;
+                }
+            }
+            parts.add(code.substring(start));
+            return parts;
+        }
+
+        private static String memberIndent(List<String> code, int declaration, int close) {
+            int depth = 0;
+            for (int i = declaration; i < close; i++) {
+                String line = code.get(i);
+                if (depth == 1 && MEMBER_DECLARATION.matcher(line).find()) return leadingSpace(line);
+                for (int j = 0; j < line.length(); j++) {
+                    char c = line.charAt(j);
+                    if (c == '{') depth++;
+                    else if (c == '}') depth--;
+                }
+            }
+            return leadingSpace(code.get(declaration)) + "   ";
+        }
+
+        private static String leadingSpace(String line) {
+            return line.substring(0, line.length() - line.stripLeading().length());
         }
     }
 }
