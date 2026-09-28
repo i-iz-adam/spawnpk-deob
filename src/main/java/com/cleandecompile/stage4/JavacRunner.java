@@ -2,6 +2,7 @@ package com.cleandecompile.stage4;
 
 import javax.tools.*;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -46,7 +47,12 @@ public final class JavacRunner {
         Files.createDirectories(classOutputDir);
         DiagnosticCollector<JavaFileObject> collector = new DiagnosticCollector<>();
 
-        try (StandardJavaFileManager fm = compiler.getStandardFileManager(collector, null, null)) {
+        // UTF-8 explicitly, not the platform default: the swap-round parse
+        // gate reads the same sources as UTF-8, and a platform-default read
+        // here would let the gate and the compile it gates disagree about
+        // what a non-ASCII file says.
+        try (StandardJavaFileManager fm = compiler.getStandardFileManager(
+                collector, null, StandardCharsets.UTF_8)) {
             fm.setLocationFromPaths(StandardLocation.CLASS_OUTPUT, List.of(classOutputDir));
             if (!classpath.isEmpty()) {
                 fm.setLocationFromPaths(StandardLocation.CLASS_PATH,
