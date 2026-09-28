@@ -25,11 +25,19 @@ import java.util.function.Function;
  */
 public final class Stage1Runner {
 
-    private final List<Decompiler> priorityChain = List.of(
-            new VineflowerDecompiler(),
-            new CfrDecompiler(),
-            new ProcyonDecompiler()
-    );
+    private final List<Decompiler> priorityChain;
+
+    public Stage1Runner() {
+        this(List.of(
+                new VineflowerDecompiler(),
+                new CfrDecompiler(),
+                new ProcyonDecompiler()
+        ));
+    }
+
+    public Stage1Runner(List<Decompiler> priorityChain) {
+        this.priorityChain = List.copyOf(priorityChain);
+    }
 
     /** Backend names in priority order, for swap-round bookkeeping. */
     public List<String> backendNames() {
@@ -93,22 +101,34 @@ public final class Stage1Runner {
     /**
      * Re-decompiles a subset of classes and overwrites their files -- the
      * swap-round path: Stage 4 names failing files, the orchestrator retries
-     * them while excluding backends already selected for them, recompiles,
-     * and keeps the swap only if the whole tree got better. No cleaning, no
+     * them excluding the backends already selected for them, recompiles, and
+     * keeps the swap only if the whole tree got better. No cleaning, no
      * manifest write (the orchestrator merges). Returns null entries for
      * files with no remaining untried backend.
+     *
+     * <p>Each target's set names the backends to <b>exclude</b> for it
+     * (already-selected winners), never the ones to try: passing the untried
+     * set instead would make a round exclude exactly the backend it exists to
+     * try, a guaranteed no-op. The worker chain is shared by every target in
+     * the round, so a backend leaves the chain only if <i>every</i> target
+     * excludes it (the intersection); each target then drops its own
+     * exclusions when picking candidates. A file whose every backend is
+     * excluded gets no candidate and its file is left untouched.
      *
      * @param allNormalizedClasses the full table (cross-class resolution),
      *                             not just the targets.
      */
     public List<DecompileResult> redecompile(PipelineConfig config, List<ClassInfo> allNormalizedClasses,
-                                             Map<ClassInfo, java.util.Set<String>> targets)
+                                             Map<ClassInfo, java.util.Set<String>> excludedBackendsByTarget)
             throws IOException {
-        if (targets.isEmpty()) return List.of();
-        java.util.Set<String> union = new java.util.LinkedHashSet<>();
-        for (var backends : targets.values()) union.addAll(backends);
+        if (excludedBackendsByTarget.isEmpty()) return List.of();
+        java.util.Set<String> excludedByEveryone = new java.util.LinkedHashSet<>(priorityChain.stream()
+                .map(Decompiler::name).toList());
+        for (var backends : excludedBackendsByTarget.values()) {
+            excludedByEveryone.retainAll(backends);
+        }
         List<Decompiler> chain = priorityChain.stream()
-                .filter(d -> union.contains(d.name()))
+                .filter(d -> !excludedByEveryone.contains(d.name()))
                 .toList();
         if (chain.isEmpty()) return List.of();
         Function<String, byte[]> bytesProvider = bytesProvider(tableOf(allNormalizedClasses));
@@ -117,7 +137,7 @@ public final class Stage1Runner {
         List<DecompileResult> results = new java.util.ArrayList<>();
         VineflowerDecompiler.setLibraryJar(config.normalizedJarPath());
         try {
-            for (var entry : targets.entrySet()) {
+            for (var entry : excludedBackendsByTarget.entrySet()) {
                 DecompileResult swapped = decompileOne(entry.getKey(), worker, selector, bytesProvider, config,
                         entry.getValue());
                 if (swapped != null) results.add(swapped);
@@ -136,25 +156,28 @@ public final class Stage1Runner {
     }
 
     /**
-     * @param excludeBackends winners already tried for this file (swap
-     *                        rounds); empty in the normal path. A null return
-     *                        means every successful backend was excluded --
-     *                        the file is left untouched.
+     * @param excludedBackendNames backend names that must NOT be considered
+     *                             for this file -- the backends already
+     *                             selected for it (swap rounds); empty in
+     *                             the normal path, where every backend
+     *                             competes. A null return means every
+     *                             backend that produced output was
+     *                             excluded -- the file is left untouched.
      */
     private DecompileResult decompileOne(ClassInfo ci, DecompileWorker worker, OutputSelector selector,
                                          Function<String, byte[]> bytesProvider, PipelineConfig config,
-                                         java.util.Set<String> excludeBackends) throws IOException {
+                                         java.util.Set<String> excludedBackendNames) throws IOException {
         var outputs = worker.decompileAll(ci.internalName(), ci.bytes(), bytesProvider);
         List<DecompileResult.AttemptLogEntry> logs = new java.util.ArrayList<>();
         Map<String, String> candidates = new java.util.LinkedHashMap<>();
         for (var output : outputs) {
             logs.add(output.logEntry());
-            if (output.source() != null && !excludeBackends.contains(output.decompilerName())) {
+            if (output.source() != null && !excludedBackendNames.contains(output.decompilerName())) {
                 candidates.put(output.decompilerName(), output.source());
             }
         }
         if (candidates.isEmpty()) {
-            if (!excludeBackends.isEmpty()) return null;
+            if (!excludedBackendNames.isEmpty()) return null;
             String stub = DecompileWorker.StubGenerator.generate(
                     ci.internalName(), ci.bytes(), bytesProvider);
             DecompileResult stubResult =
