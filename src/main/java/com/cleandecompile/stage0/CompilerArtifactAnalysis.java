@@ -58,6 +58,13 @@ import java.util.Set;
  * same class, return" <i>and</i> it overrides something -- the second
  * condition keeps a hand-written delegate from being hidden.
  *
+ * <p>The third condition is that the bridge's descriptor <b>differs</b>
+ * from its target's. That is what makes a bridge a bridge: it exists to
+ * widen an erased signature to a specific one, so the two can never match.
+ * A forwarder whose descriptor equals its target's is an ordinary delegate,
+ * and hiding it is pure damage -- the decompiler drops the declaration and
+ * keeps the call sites, so the class stops compiling.
+ *
  * <p>The bridge's target is returned too, because in this jar the bridge
  * kept its (library-mandated) name while the real implementation was
  * renamed independently; {@link MemberRenamePlanner} uses the pairs to
@@ -308,6 +315,16 @@ final class CompilerArtifactAnalysis {
         if (code.get(i).getOpcode() != returnOpcode(bridgeReturn)) return null;
 
         if (call.name.equals(bridge.name) && call.desc.equals(bridge.desc)) return null; // self-recursion
+        // A javac bridge exists to bridge an ERASED signature to a specific
+        // one, so its descriptor always differs from its target's. Equal
+        // descriptors mean this is a hand-written delegate, and javac would
+        // refuse two methods in one class sharing a name and descriptor --
+        // so it cannot be the compiler artifact being recovered here.
+        // Treating it as one is actively harmful: BytecodeNormalizer
+        // re-flags it ACC_BRIDGE, both decompilers then drop the
+        // declaration, and every surviving call site fails to resolve
+        // ("no suitable method found for m(int,int,int,int,int)").
+        if (call.desc.equals(bridge.desc)) return null;
         Type[] targetArgs = Type.getArgumentTypes(call.desc);
         if (targetArgs.length != bridgeArgs.length) return null;
         for (int p = 0; p < targetArgs.length; p++) {
