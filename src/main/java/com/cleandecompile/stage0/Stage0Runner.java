@@ -86,7 +86,10 @@ public final class Stage0Runner {
                 loaded.classes(), classRenameResult.renameMap(),
                 memberRenameResult.methodRenameMap(), memberRenameResult.fieldRenameMap(),
                 config.decompileLibraries(), repairs);
-        System.out.printf("  normalization done in %.1fs%n", elapsedSec(t3));
+        long bridged = normResult.warnings().stream()
+                .filter(w -> w.message().startsWith("lambda capture bridged")).count();
+        System.out.printf("  normalization done in %.1fs (%d lambda capture bridge%s added)%n",
+                elapsedSec(t3), bridged, bridged == 1 ? "" : "s");
 
         writeJar(config, normResult.normalizedClasses(), loaded.resources());
         writeManifest(config, classRenameResult.manifestEntries(), memberRenameResult.manifestEntries(),

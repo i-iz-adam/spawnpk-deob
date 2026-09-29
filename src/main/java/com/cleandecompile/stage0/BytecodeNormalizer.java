@@ -225,6 +225,19 @@ public final class BytecodeNormalizer {
             }
         }
 
+        if (stripSynthetic) {
+            // Lambdas a method reference cannot express (captured arguments
+            // beyond the receiver) get a synthetic body of their own, or
+            // Vineflower prints them as `this::m` and drops the arguments.
+            // Runs after the flag pass: "already inlinable" is judged from
+            // the flags as they now stand.
+            for (LambdaCaptureBridger.Bridge b : LambdaCaptureBridger.bridge(node, repairs)) {
+                warnings.add(new Warning(ci.internalName(),
+                        "lambda capture bridged (a method reference cannot carry its captured arguments): "
+                                + b.name() + b.descriptor() + " -> " + b.wrapped()));
+            }
+        }
+
         ClassWriter writer = new HierarchyAwareClassWriter(
                 ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS, typeHierarchy);
         ClassRemapper remapVisitor = new ClassRemapper(writer, remapper);
