@@ -13,11 +13,11 @@ scaffolding + vendored libs -> Stage 4 javac compile-fix loop.
 
 | Stage | State |
 |---|---|
-| 0 — Bytecode normalization | Implemented. Scope-aware renames (classes, packages, fields, methods), override-safe method families, `minKeepableLength` keep heuristic (short junk renamed, long genuine names kept), custom-name overrides, frame repair. |
+| 0 — Bytecode normalization | Implemented. Scope-aware renames (classes, packages, fields, methods), override-safe method families, `minKeepableLength` keep heuristic (short junk renamed, long genuine names kept), custom-name overrides, frame repair, lambda-body/bridge re-flagging, and **lambda capture bridging** (`LambdaCaptureBridger`: a `lambda$stage0$N` shim for every lambda whose captured arguments a method reference cannot express). |
 | 1 — Multi-decompiler harness | **Vineflower + CFR wired (in-process, per-class timeouts, full-jar + JDK library context).** Procyon backend still a stub. Every backend runs per class; `--decompile-libraries` unaffected. |
 | 2 — Output selection | Heuristic pick (raw/synthetic/residue/Object/method-ref-arity signals) plus **swap rounds**: failing files are retried with untried backends and the swap is kept only if whole-tree errors strictly drop (reverts otherwise). Formatting pass still TODO. |
 | 3 — Resource & build scaffolding | Implemented. Libraries vendored into `src-generated/libs/`, Gradle build at release level, `run.bat` when `--main-class` given. Dependency fingerprinting against Maven Central is a stub. |
-| 4 — Compile-fix loop | Real javac loop: import insertion, string-concat/bootstrap rewrite, raw casts, decompiler artifacts, String compareTo, access widening, receiver casts. Equilibrium stop, per-fixer logging. Bridge-method removal still TODO. |
+| 4 — Compile-fix loop | Real javac loop: import insertion, string-concat/bootstrap rewrite, raw casts, decompiler artifacts, String compareTo, access widening, receiver casts, checked-exception wrapping, plus **span-driven fixers** (int/boolean coercion, generic type-argument casts) and **missing-override repair** (delegate to the Stage-0-renamed override, or a marked canonical default for a few JDK layout hooks). Equilibrium stop, per-fixer logging. Also span-driven: **enum restoration** (`class X extends Enum<X>` back to `enum`, plus unqualifying the case labels earlier fixers qualified) and **dead-catch keep-alive**. Bridge-method removal still TODO. |
 
 ## Building
 
@@ -128,8 +128,34 @@ out/
   `stubs/`, pulled in via `--extra-sources`. Zero eawt errors remain.
 - Lombok-annotated sources: `--lombok-jar` (pinned under `lib/`) for
   Stage 4 symbols, Gradle processor wiring when used. Zero lombok errors.
-- Remaining ~220 errors are decompiler-precision fallout (method-ref and
-  generics inference, raw-vs-generic override shapes like `method1327`,
-  a few single-site artifacts) -- the manifest lists each; CFR backend or
-  human passes own them.
+- Remaining errors are decompiler-precision fallout. Two manifests (28 errors /
+  13 files, then 56 / 20) are triaged in `docs/stage4-remainder-triage.md`; the
+  first one: about
+  half are now handled mechanically (int/boolean conflation, generic
+  type-argument mismatches, `LayoutManager2` gaps, value-returning
+  `IOException` sites); the rest (wrong-arity calls to methods that do not
+  exist, `Object`-typed locals with no usage evidence, array/element swaps,
+  undefined `varN_M` temporaries) need information that is not in the
+  diagnostic and stay with a human or another backend.
 - CFR/Procyon backends unwired; Maven fingerprinting stubbed (0 identified).
+
+## Stage 4 fixer notes
+
+- **Span-driven fixers** (`SpanFixers`, `PrimitiveCoercionFixer`,
+  `GenericCastFixer`) edit by javac's own character offsets against a fresh
+  parse, not by line regex. They run first in each round (offsets are only
+  valid against the text javac compiled) and are line-neutral, so the later
+  line-based fixers keep valid line numbers.
+- **Enum / catch planners** (`EnumRestoreFixer`, `EnumCaseLabelFixer`,
+  `UnreachableCatchFixer`) are span planners too and line-neutral: removed
+  members are blanked, not deleted. The enum planner converts only when the
+  whole class matches a shape it fully understands and otherwise leaves the
+  error for a human. Dead catches are kept alive with a marked
+  `if (false) { throw (X) null; }`, never deleted (see the triage doc).
+- **Synthesized code is marked.** The only fixer that invents behaviour is the
+  curated `LayoutManager2` default table in `MissingOverrideFixer`; every stub
+  it writes carries `TODO(stage4)` and the loop prints a count. Search for it
+  before shipping. Delegating stubs carry `// stage4: delegates to methodNNN`.
+- A value-returning method with an unreported checked exception is wrapped with
+  a catch that **rethrows unchecked** (`UncheckedIOException` /
+  `RuntimeException`), never a swallowed exception with an invented result.
