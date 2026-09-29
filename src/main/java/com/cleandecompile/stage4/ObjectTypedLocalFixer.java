@@ -14,11 +14,14 @@ import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.ForLoopTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.ImportTree;
+import com.sun.source.tree.InstanceOfTree;
 import com.sun.source.tree.LambdaExpressionTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.ReturnTree;
 import com.sun.source.tree.Tree;
+import com.sun.source.tree.TypeCastTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.tree.WhileLoopTree;
 import com.sun.source.util.JavacTask;
@@ -27,6 +30,7 @@ import com.sun.source.util.TreePath;
 import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
 
+import javax.lang.model.SourceVersion;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
@@ -34,11 +38,14 @@ import javax.lang.model.element.Modifier;
 import javax.lang.model.element.NestingKind;
 import javax.lang.model.element.PackageElement;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.element.TypeParameterElement;
 import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.ExecutableType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
+import javax.lang.model.type.TypeVariable;
 import javax.lang.model.type.WildcardType;
 import javax.lang.model.util.ElementFilter;
 import javax.lang.model.util.Elements;
@@ -79,6 +86,8 @@ import java.util.stream.Stream;
  *   <li>{@code cannot find symbol ... location: variable v of type Object}
  *       (method call or field access on an {@code Object} local)</li>
  *   <li>{@code bad operand types for binary operator ... Object / char}</li>
+ *   <li>{@code incompatible types: Object cannot be converted to X}
+ *       (an {@code Object} local passed where the callee demands {@code X})</li>
  * </ul>
  *
  * <h2>Why these appear</h2>
@@ -131,8 +140,15 @@ final class ObjectTypedLocalFixer {
             "array required, but (?:java\\.lang\\.)?Object found"
                     + "|for-each not applicable to expression type[\\s\\S]*found:\\s+(?:java\\.lang\\.)?Object\\s*$"
                     + "|cannot find symbol[\\s\\S]*location: variable \\w+ of type (?:java\\.lang\\.)?Object\\s*$"
-                    + "|bad operand types for binary operator[\\s\\S]*(?:first|second) type:\\s+(?:java\\.lang\\.)?Object\\b");
+                    + "|bad operand types for binary operator[\\s\\S]*(?:first|second) type:\\s+(?:java\\.lang\\.)?Object\\b"
+                    + "|incompatible types: (?:java\\.lang\\.)?Object cannot be converted to ");
     private static final Pattern BAD_OPERAND = Pattern.compile("bad operand types for binary operator");
+    /** An {@code Object} where the callee demands a specific type. The source
+     *  type has to be the bare {@code Object}: {@code Consumer<T> cannot be
+     *  converted to Consumer<Object>} is a generics mismatch, not a widened
+     *  local. */
+    private static final Pattern CONVERTED = Pattern.compile(
+            "incompatible types: (?:java\\.lang\\.)?Object cannot be converted to ");
 
     /** Name-based guesses, tried only when neither assignments nor the
      *  source tree give evidence. Order is irrelevant; a candidate wins only
@@ -204,11 +220,23 @@ final class ObjectTypedLocalFixer {
     // Model
     // ------------------------------------------------------------------
 
-    private enum Role { ARRAY, ITERATE, METHOD, FIELD, PRIMITIVE }
+    /**
+     * What a use of an Object-typed variable demands.
+     *
+     * <p>The first six are the shapes javac reports, so a per-use cast can
+     * serve each of them. The last four only ever appear in {@link VarInfo#uses}
+     * -- they are legal with an {@code Object} declaration and can stop being
+     * legal the moment it is narrowed, so the retype gate has to judge them.
+     * {@link #OTHER} is the "cannot classify" verdict, and it blocks.
+     */
+    private enum Role { ARRAY, ARRAY_INDEX, ITERATE, METHOD, FIELD, PRIMITIVE, PASS,
+                       PRIMITIVE_ARGUMENT, CAST, INSTANCEOF, COMPARISON, CONCAT, RETURN, OTHER }
 
-    /** One flagged use of an Object-typed variable. */
+    /** One mention of an Object-typed variable, and the demand it makes.
+     *  {@code required} carries the type a {@link Role#PASS} or
+     *  {@link Role#CAST} or {@link Role#INSTANCEOF} use needs. */
     private record Site(TreePath path, String var, int start, int end, int line,
-                        Role role, String member, int arity) {
+                        Role role, String member, int arity, TypeMirror required) {
     }
 
     /** One assignment (or initializer) of the variable. */
@@ -220,7 +248,13 @@ final class ObjectTypedLocalFixer {
         VariableTree decl;
         TreePath declPath;
         final List<Def> defs = new ArrayList<>();
+        /** The uses javac complained about: the ones a cast can serve, and the
+         *  only ones that justify a retype at all. */
         final List<Site> sites = new ArrayList<>();
+        /** Every use, flagged or not. A retype is judged against this, since a
+         *  use that compiled only because the declaration said Object would
+         *  otherwise become a fresh error nothing is watching for. */
+        final List<Site> uses = new ArrayList<>();
 
         VarInfo(VariableElement element) {
             this.element = element;
@@ -251,6 +285,10 @@ final class ObjectTypedLocalFixer {
         private TypeMirror iterableRaw;
         private Set<String> objectMethodNames;
         private Map<String, Set<String>> fieldOwners;
+        /** Stands in for "this call's parameter types are unknown", so the
+         *  cache can record a miss. */
+        private static final TypeMirror[] NO_PARAMS = new TypeMirror[0];
+        private final Map<String, TypeMirror[]> parameterCache = new HashMap<>();
         private final List<String> guessLog = new ArrayList<>();
 
         Session(Path sourceRoot, List<Path> classpath, String releaseLevel) {
@@ -297,10 +335,21 @@ final class ObjectTypedLocalFixer {
                     Path file = pathOf(cu.getSourceFile());
                     var diags = file == null ? null : flagged.get(file);
                     if (diags == null) continue;
-                    Set<Integer> binaryLines = diags.stream()
-                            .filter(d -> BAD_OPERAND.matcher(d.getMessage(Locale.ENGLISH)).find())
-                            .map(d -> (int) d.getLineNumber()).collect(Collectors.toSet());
-                    FilePlanner planner = new FilePlanner(cu, binaryLines);
+                    Set<Integer> binaryLines = new HashSet<>();
+                    for (var d : diags) {
+                        if (!BAD_OPERAND.matcher(d.getMessage(Locale.ENGLISH)).find()) continue;
+                        int at = (int) d.getLineNumber();
+                        binaryLines.add(at);
+                        binaryLines.add(at + 1); // wrapped call chains report the next line
+                    }
+                    Set<Integer> passLines = new HashSet<>();
+                    for (var d : diags) {
+                        if (!CONVERTED.matcher(d.getMessage(Locale.ENGLISH)).find()) continue;
+                        int at = (int) d.getLineNumber();
+                        passLines.add(at);
+                        passLines.add(at + 1); // wrapped call chains report the next line
+                    }
+                    FilePlanner planner = new FilePlanner(cu, binaryLines, passLines);
                     List<Edit> edits = planner.plan();
                     if (edits.isEmpty()) continue;
                     String text = cu.getSourceFile().getCharContent(true).toString();
@@ -360,15 +409,17 @@ final class ObjectTypedLocalFixer {
         private final class FilePlanner {
             private final CompilationUnitTree cu;
             private final Set<Integer> binaryLines;
+            private final Set<Integer> passLines;
             private final Map<VariableElement, VarInfo> vars = new LinkedHashMap<>();
             private final Set<Tree> methodSelects = Collections.newSetFromMap(new IdentityHashMap<>());
             /** Every line whose flagged use was addressed by an edit. */
             final Set<Integer> coveredLines = new HashSet<>();
             private final Scope scope;
 
-            FilePlanner(CompilationUnitTree cu, Set<Integer> binaryLines) {
+            FilePlanner(CompilationUnitTree cu, Set<Integer> binaryLines, Set<Integer> passLines) {
                 this.cu = cu;
                 this.binaryLines = binaryLines;
+                this.passLines = passLines;
                 this.scope = scopeOf(cu);
             }
 
@@ -410,13 +461,13 @@ final class ObjectTypedLocalFixer {
 
                 @Override
                 public Void visitArrayAccess(ArrayAccessTree node, Void p) {
-                    site(getCurrentPath(), node.getExpression(), Role.ARRAY, null, 0);
+                    site(getCurrentPath(), node.getExpression(), Role.ARRAY, null, 0, null);
                     return super.visitArrayAccess(node, p);
                 }
 
                 @Override
                 public Void visitEnhancedForLoop(EnhancedForLoopTree node, Void p) {
-                    site(getCurrentPath(), node.getExpression(), Role.ITERATE, null, 0);
+                    site(getCurrentPath(), node.getExpression(), Role.ITERATE, null, 0, null);
                     return super.visitEnhancedForLoop(node, p);
                 }
 
@@ -427,10 +478,37 @@ final class ObjectTypedLocalFixer {
                         String name = ms.getIdentifier().toString();
                         if (!objectMethodNames.contains(name)) {
                             site(new TreePath(getCurrentPath(), ms), ms.getExpression(), Role.METHOD,
-                                    name, node.getArguments().size());
+                                    name, node.getArguments().size(), null);
                         }
                     }
+                    arguments(getCurrentPath(), node);
                     return super.visitMethodInvocation(node, p);
+                }
+
+                /** An {@code Object} local can also be wrong where there is no
+                 *  member select on it at all: handed to a call that demands a
+                 *  concrete type ({@code map.put(key, object)}). */
+                private void arguments(TreePath invocation, MethodInvocationTree node) {
+                    List<? extends ExpressionTree> args = node.getArguments();
+                    boolean identifierArgument = false;
+                    for (ExpressionTree arg : args) {
+                        if (arg instanceof IdentifierTree) {
+                            identifierArgument = true;
+                            break;
+                        }
+                    }
+                    if (!identifierArgument) return;
+                    TypeMirror[] required = parameterTypes(invocation, node);
+                    if (required == null) return;
+                    for (int i = 0; i < args.size() && i < required.length; i++) {
+                        if (required[i] == null) continue;
+                        // An int parameter is not a demand a reference type can
+                        // ever meet, so treating it as one would veto the whole
+                        // declaration over an argument the retype does not
+                        // concern. Role.PRIMITIVE owns the unboxing instead.
+                        if (required[i].getKind().isPrimitive()) continue;
+                        site(invocation, args.get(i), Role.PASS, null, 0, required[i]);
+                    }
                 }
 
                 @Override
@@ -438,9 +516,9 @@ final class ObjectTypedLocalFixer {
                     if (!methodSelects.contains(node)) {
                         String name = node.getIdentifier().toString();
                         if (name.equals("length")) {
-                            site(getCurrentPath(), node.getExpression(), Role.ARRAY, null, 0);
+                            site(getCurrentPath(), node.getExpression(), Role.ARRAY, null, 0, null);
                         } else if (!name.equals("class") && !name.equals("this") && !name.equals("super")) {
-                            site(getCurrentPath(), node.getExpression(), Role.FIELD, name, 0);
+                            site(getCurrentPath(), node.getExpression(), Role.FIELD, name, 0, null);
                         }
                     }
                     return super.visitMemberSelect(node, p);
@@ -453,19 +531,183 @@ final class ObjectTypedLocalFixer {
                     return super.visitBinary(node, p);
                 }
 
+                @Override
+                public Void visitIdentifier(IdentifierTree node, Void p) {
+                    TreePath path = getCurrentPath();
+                    VarInfo v = objectVar(path);
+                    if (v != null) use(v, path);
+                    return super.visitIdentifier(node, p);
+                }
+
+                /**
+                 * Classifies one occurrence for the retype gate. Deliberately
+                 * separate from {@link #site}: a site is a demand javac
+                 * reported and a cast can answer, while a use is every mention
+                 * of the variable, and anything this cannot classify becomes
+                 * {@link Role#OTHER} and blocks the retype. Guessing here would
+                 * be the whole defect: the retype changes the static type of
+                 * every mention, not just the reported one.
+                 */
+                private void use(VarInfo v, TreePath path) {
+                    TreePath parent = path.getParentPath();
+                    if (parent == null) return;
+                    Tree leaf = parent.getLeaf();
+                    if (leaf instanceof AssignmentTree a && a.getVariable() == path.getLeaf()) {
+                        return; // a definition, judged as a def rather than a use
+                    }
+                if (leaf instanceof TypeCastTree cast) {
+                    record(v, path, Role.CAST, null, 0, typeOf(parent, cast.getType()));
+                } else if (leaf instanceof InstanceOfTree io && io.getExpression() == path.getLeaf()) {
+                    record(v, path, Role.INSTANCEOF, null, 0, typeOf(parent, io.getType()));
+                } else if (leaf instanceof EnhancedForLoopTree loop && loop.getExpression() == path.getLeaf()) {
+                    record(v, path, Role.ITERATE, null, 0, null);
+                } else if (leaf instanceof ArrayAccessTree access) {
+                    if (access.getExpression() == path.getLeaf()) {
+                        record(v, path, Role.ARRAY, null, 0, null);
+                    } else {
+                        // An index is int-convertible by definition (JLS 15.15.1),
+                        // whatever type it happens to be written with.
+                        record(v, path, Role.ARRAY_INDEX, null, 0,
+                                types.getPrimitiveType(TypeKind.INT));
+                    }
+                } else if (leaf instanceof BinaryTree binary) {
+                    operandUse(v, path, binary);
+                } else if (leaf instanceof ReturnTree) {
+                    record(v, path, Role.RETURN, null, 0, enclosingReturnType(parent));
+                } else if (leaf instanceof MethodInvocationTree call) {
+                    argumentUse(v, path, call);
+                } else if (leaf instanceof MemberSelectTree ms) {
+                    memberUse(v, path, ms, parent.getParentPath());
+                } else {
+                    // A ternary arm, an initializer, a field assignment: legal
+                    // with Object, and narrowing can change which type it means.
+                    record(v, path, Role.OTHER, null, 0, null);
+                }
+            }
+
+                /**
+                 * A binary operand. Only two of the shapes have a decidable
+                 * meaning after narrowing: a comparison, which needs the two
+                 * sides comparable, and a concatenation, which string-converts
+                 * whatever it is given. Anything else is arithmetic, whose
+                 * promotion rules are not worth reasoning about here.
+                 */
+                private void operandUse(VarInfo v, TreePath path, BinaryTree binary) {
+                    ExpressionTree other = binary.getLeftOperand() == path.getLeaf()
+                            ? binary.getRightOperand() : binary.getLeftOperand();
+                    TypeMirror otherType = staticType(new TreePath(path.getParentPath(), other));
+                    if (otherType == null) {
+                        record(v, path, Role.OTHER, null, 0, null);
+                        return;
+                    }
+                    if (otherType.getKind().isPrimitive()) {
+                        // Unboxing is the only way a reference takes part, and
+                        // that is the question Role.PRIMITIVE answers.
+                        record(v, path, Role.PRIMITIVE, null, 0, null);
+                        return;
+                    }
+                    if (binary.getKind() == Tree.Kind.PLUS && isString(otherType)) {
+                        record(v, path, Role.CONCAT, null, 0, null);
+                        return;
+                    }
+                    if (binary.getKind() == Tree.Kind.EQUAL_TO || binary.getKind() == Tree.Kind.NOT_EQUAL_TO
+                            || binary.getKind() == Tree.Kind.LESS_THAN
+                            || binary.getKind() == Tree.Kind.GREATER_THAN
+                            || binary.getKind() == Tree.Kind.LESS_THAN_EQUAL
+                            || binary.getKind() == Tree.Kind.GREATER_THAN_EQUAL) {
+                        record(v, path, Role.COMPARISON, null, 0, otherType);
+                        return;
+                    }
+                    record(v, path, Role.OTHER, null, 0, null);
+            }
+
+                private void argumentUse(VarInfo v, TreePath path, MethodInvocationTree call) {
+                    List<? extends ExpressionTree> args = call.getArguments();
+                    int index = -1;
+                    for (int i = 0; i < args.size(); i++) {
+                        if (args.get(i) == path.getLeaf()) {
+                            index = i;
+                            break;
+                        }
+                    }
+                    if (index < 0) return;
+                    TypeMirror[] required = parameterTypes(path.getParentPath(), call);
+                    if (required == null || index >= required.length || required[index] == null) {
+                        record(v, path, Role.OTHER, null, 0, null); // an unresolved demand is no demand
+                        return;
+                    }
+                    if (required[index].getKind().isPrimitive()) {
+                        // Unboxing is Role.PRIMITIVE's to own, and no reference
+                        // type can ever satisfy it -- so it must not veto the
+                        // declaration as a whole.
+                        record(v, path, Role.PRIMITIVE_ARGUMENT, null, 0, null);
+                        return;
+                    }
+                    record(v, path, Role.PASS, null, 0, required[index]);
+                }
+
+                private void memberUse(VarInfo v, TreePath path, MemberSelectTree ms, TreePath grand) {
+                    String name = ms.getIdentifier().toString();
+                    // Declared by Object, so it exists on every type and can
+                    // never be what breaks.
+                    if (objectMethodNames.contains(name)) return;
+                    if (name.equals("length")) {
+                        record(v, path, Role.ARRAY, null, 0, null);
+                        return;
+                    }
+                    if (name.equals("class") || name.equals("this") || name.equals("super")) return;
+                    if (grand != null && grand.getLeaf() instanceof MethodInvocationTree call
+                            && call.getMethodSelect() == ms) {
+                        record(v, path, Role.METHOD, name, call.getArguments().size(), null);
+                        return;
+                    }
+                    record(v, path, Role.FIELD, name, 0, null);
+                }
+
+                private void record(VarInfo v, TreePath path, Role role, String member, int arity,
+                                    TypeMirror required) {
+                    Tree leaf = path.getLeaf();
+                    if (!(leaf instanceof IdentifierTree id)) return;
+                    long start = positions.getStartPosition(cu, leaf);
+                    long end = positions.getEndPosition(cu, leaf);
+                    if (start < 0 || end < 0) return;
+                    v.uses.add(new Site(path, id.getName().toString(), (int) start, (int) end,
+                            (int) cu.getLineMap().getLineNumber(start), role, member, arity, required));
+                }
+
+                private TypeMirror typeOf(TreePath parent, Tree type) {
+                    return staticType(new TreePath(parent, type));
+                }
+
+                /** The enclosing method's declared return type: the demand a
+                 *  {@code return v;} makes. */
+                private TypeMirror enclosingReturnType(TreePath path) {
+                    for (TreePath p = path; p != null; p = p.getParentPath()) {
+                        Tree t = p.getLeaf();
+                        if (t instanceof ClassTree) return null;
+                        if (t instanceof MethodTree m && m.getReturnType() != null) {
+                            return typeOf(p, m.getReturnType());
+                        }
+                    }
+                    return null;
+                }
+
                 private void operand(ExpressionTree candidate, ExpressionTree other) {
                     if (!(candidate instanceof IdentifierTree)) return;
                     TypeMirror ot = trees.getTypeMirror(new TreePath(getCurrentPath(), other));
                     if (ot == null || !ot.getKind().isPrimitive()) return;
                     // Only where javac actually rejected it: some Object/primitive
                     // comparisons are accepted, and casting those would change meaning.
-                    site(getCurrentPath(), candidate, Role.PRIMITIVE, null, 0);
+                    site(getCurrentPath(), candidate, Role.PRIMITIVE, null, 0, null);
                 }
 
                 /** Records a use of {@code expr} when it is an Object-typed
                  *  local/parameter (identifier only -- no chains). {@code parent}
-                 *  is the path of the node whose direct child {@code expr} is. */
-                private void site(TreePath parent, ExpressionTree expr, Role role, String member, int arity) {
+                 *  is the path of the node whose direct child {@code expr} is.
+                 *  {@code required} is the type the use demands, for
+                 *  {@link Role#PASS}. */
+                private void site(TreePath parent, ExpressionTree expr, Role role, String member, int arity,
+                                  TypeMirror required) {
                     if (!(expr instanceof IdentifierTree id)) return;
                     VarInfo v = objectVar(new TreePath(parent, expr));
                     if (v == null) return;
@@ -474,8 +716,12 @@ final class ObjectTypedLocalFixer {
                     if (start < 0 || end < 0) return;
                     int line = (int) cu.getLineMap().getLineNumber(start);
                     if (role == Role.PRIMITIVE && !binaryLines.contains(line)) return;
+                    // Likewise for a passed argument: an Object where any
+                    // supertype is wanted is legal plenty of the time, and an
+                    // unflagged line says nothing about what was demanded.
+                    if (role == Role.PASS && !passLines.contains(line)) return;
                     v.sites.add(new Site(new TreePath(parent, expr), id.getName().toString(),
-                            (int) start, (int) end, line, role, member, arity));
+                            (int) start, (int) end, line, role, member, arity, required));
                 }
 
                 private VarInfo objectVar(TreePath identPath) {
@@ -545,6 +791,7 @@ final class ObjectTypedLocalFixer {
                 }
 
                 Map<Site, TypeMirror> resolved = new IdentityHashMap<>();
+                Map<Site, TypeMirror> sourceOf = new IdentityHashMap<>();
                 Set<Site> guessed = Collections.newSetFromMap(new IdentityHashMap<>());
                 for (var entry : regions.entrySet()) {
                     TypedDef reaching = entry.getKey() >= 0 ? defs.get(entry.getKey()) : null;
@@ -557,7 +804,10 @@ final class ObjectTypedLocalFixer {
                                 if (inf.guess()) guessed.add(s);
                             }
                         }
-                        if (t != null) resolved.put(s, t);
+                        if (t != null) {
+                            resolved.put(s, t);
+                            sourceOf.put(s, reaching == null ? null : reaching.type());
+                        }
                     }
                 }
 
@@ -578,6 +828,7 @@ final class ObjectTypedLocalFixer {
                     TypeMirror t = resolved.get(s);
                     String src = t == null ? null : render(t, pkg);
                     if (src == null) continue;
+                    if (t.getKind().isPrimitive() && !boxedSource(sourceOf.get(s))) continue;
                     edits.add(new Edit(s.start(), s.end(), s.var(), "((" + src + ") " + s.var() + ")"));
                     coveredLines.add(s.line());
                     if (guessed.contains(s)) {
@@ -585,6 +836,18 @@ final class ObjectTypedLocalFixer {
                                 + " " + s.var() + " -> " + src);
                     }
                 }
+            }
+
+            /**
+             * Whether the assignment reaching a use put a boxed value in the
+             * slot. It always did: the JVM verifier types an interface value
+             * as Object, and the source's {@code Object v = 1} boxes on the
+             * way in. So a cast to a primitive compiles and then throws
+             * ClassCastException -- unless the value really is the boxed type,
+             * which is the one case where the cast is safe.
+             */
+            private boolean boxedSource(TypeMirror def) {
+                return def != null && def.getKind() == TypeKind.DECLARED;
             }
 
             private String sourceText;
@@ -659,32 +922,53 @@ final class ObjectTypedLocalFixer {
                         else if (!types.isSameType(common, t)) return null;
                     }
                 }
-                if (common == null) return null;
+                TypeMirror declared = declarationType(common);
+                if (declared == null) return null;
                 // Reference types only: retyping to a primitive would drop
                 // boxing (== identity). char[] only: overloads like
                 // append/valueOf/println treat it differently from Object.
-                boolean referenceType = common.getKind() == TypeKind.DECLARED || common.getKind() == TypeKind.ARRAY;
+                // A type variable stands for whatever it was instantiated with,
+                // so it boxes and compares no worse than Object did.
+                boolean referenceType = switch (declared.getKind()) {
+                    case DECLARED, ARRAY, TYPEVAR -> true;
+                    default -> false;
+                };
                 if (!referenceType) return null;
-                if (common.getKind() == TypeKind.ARRAY
-                        && ((ArrayType) common).getComponentType().getKind() == TypeKind.CHAR) {
+                if (declared.getKind() == TypeKind.ARRAY
+                        && ((ArrayType) declared).getComponentType().getKind() == TypeKind.CHAR) {
                     return null;
                 }
                 for (TypedDef d : defs) {
-                    if (d.type() == null || !types.isAssignable(d.type(), common)) return null;
+                    if (d.type() == null || !types.isAssignable(d.type(), declared)) return null;
                 }
-                return render(common, pkg);
+                // The decision above only ever saw the uses javac reported.
+                // A retype changes the static type of EVERY mention, so one
+                // that compiled only because the declaration said Object --
+                // an instanceof against a final class, a cast between two
+                // final types, an argument position the collectors never
+                // reach -- would turn into a fresh error. Any such use blocks
+                // the retype and leaves the declaration alone, which is safe:
+                // the per-use cast path below can still fix what was reported.
+                for (Site use : v.uses) {
+                    if (!satisfies(declared, use)) return null;
+                }
+                return declarationText(declared, pkg);
             }
 
             /** A type every typed assignment is assignable to and that has what
              *  every flagged use needs; null when there is none (an untyped
-             *  assignment, unrelated types, or a use the type cannot serve). */
+             *  assignment, unrelated types, or a use the type cannot serve).
+             *  Candidates are compared as the type a declaration would
+             *  spell, so a wildcard capture is weighed by the type variable
+             *  bounding it. */
             private TypeMirror commonOfDefs(List<TypedDef> defs, List<Site> sites) {
                 if (defs.isEmpty() || sites.isEmpty()) return null;
                 for (TypedDef d : defs) {
                     if (d.type() == null) return null;
                 }
                 for (TypedDef candidate : defs) {
-                    TypeMirror t = candidate.type();
+                    TypeMirror t = declarationType(candidate.type());
+                    if (t == null) continue;
                     boolean all = true;
                     for (TypedDef other : defs) {
                         if (!types.isAssignable(other.type(), t)) {
@@ -743,13 +1027,118 @@ final class ObjectTypedLocalFixer {
                     && ((TypeElement) ((DeclaredType) t).asElement()).getQualifiedName().contentEquals("java.lang.Object");
         }
 
+        /**
+         * The parameter types the callee demands, indexed by argument
+         * position, or null when they cannot be pinned down.
+         *
+         * <p>Not via the method select: on a call javac has already rejected
+         * the select carries a synthetic error symbol (a {@code ClassSymbol}
+         * named after the method), not the real one. So the callee is found
+         * by name and arity among the receiver's members instead -- and only
+         * when exactly one such method exists, since a demand that does not
+         * match the real signature would make an unsound fix look sound.
+         */
+        private TypeMirror[] parameterTypes(TreePath invocation, MethodInvocationTree node) {
+            int arity = node.getArguments().size();
+            if (arity == 0) return null;
+            ExpressionTree select = node.getMethodSelect();
+            if (!(select instanceof MemberSelectTree ms)) return null; // an implicit receiver names no owner
+            TypeMirror receiver = staticType(new TreePath(new TreePath(invocation, select), ms.getExpression()));
+            if (!(receiver instanceof DeclaredType owner)) return null;
+            // The owner is spelled out, type arguments included: List<String>.add
+            // and List<Integer>.add are the same declaration but substitute to
+            // different demands, so the name alone would answer for both.
+            String key = owner + "#" + ms.getIdentifier() + "/" + arity;
+            TypeMirror[] cached = parameterCache.get(key);
+            if (cached == null) {
+                cached = resolveParameterTypes(owner, ms.getIdentifier().toString(), arity);
+                parameterCache.put(key, cached);
+            }
+            return cached == NO_PARAMS ? null : cached;
+        }
+
+        private TypeMirror[] resolveParameterTypes(DeclaredType owner, String name, int arity) {
+            ExecutableElement match = uniqueMethod((TypeElement) owner.asElement(), name, arity);
+            if (match == null) return NO_PARAMS;
+            List<? extends TypeMirror> params;
+            try {
+                params = ((ExecutableType) types.asMemberOf(owner, match)).getParameterTypes();
+            } catch (RuntimeException e) {
+                return NO_PARAMS;
+            }
+            if (params.isEmpty()) return NO_PARAMS;
+            int slots = match.isVarArgs() ? params.size() + 1 : params.size();
+            TypeMirror[] out = new TypeMirror[slots];
+            for (int i = 0; i < params.size(); i++) {
+                TypeMirror p = params.get(i);
+                // A trailing varargs slot is fed the component type, not the array.
+                if (match.isVarArgs() && i == params.size() - 1 && p instanceof ArrayType array) {
+                    p = array.getComponentType();
+                }
+                out[i] = p != null && p.getKind() != TypeKind.ERROR ? p : null;
+            }
+            if (match.isVarArgs()) out[slots - 1] = out[params.size() - 1];
+            return out;
+        }
+
+        /** The one method of that name and arity the type declares, or null
+         *  when there is none or the choice would be a guess. */
+        private ExecutableElement uniqueMethod(TypeElement owner, String name, int arity) {
+            ExecutableElement match = null;
+            for (ExecutableElement candidate : ElementFilter.methodsIn(elements.getAllMembers(owner))) {
+                if (!candidate.getSimpleName().contentEquals(name)) continue;
+                int n = candidate.getParameters().size();
+                if (n != arity && !(candidate.isVarArgs() && arity >= n - 1)) continue;
+                if (match != null) return null;
+                match = candidate;
+            }
+            return match;
+        }
+
+        /**
+         * The type a local can be declared with, or null when nothing at this
+         * site names it. javac reports a wildcard capture as a TYPEVAR, but a
+         * capture is not a name: what a declaration may write is its single
+         * direct supertype when that is a type variable --
+         * {@code List<? extends T>.get()} returns {@code capture#N of ? extends T},
+         * and {@code T x = list.get(i)} is exactly what javac accepts, because
+         * a capture is a subtype of its upper bound. A real type variable is
+         * already its own name; a capture of anything else (an unbounded
+         * wildcard, say) has none and is left alone.
+         */
+        private TypeMirror declarationType(TypeMirror t) {
+            if (t == null) return null;
+            if (t.getKind() != TypeKind.TYPEVAR) return t;
+            if (isTypeVariable(t)) return t;
+            try {
+                List<? extends TypeMirror> supers = types.directSupertypes(t);
+                if (supers.size() == 1 && isTypeVariable(supers.get(0))) return supers.get(0);
+            } catch (RuntimeException e) {
+                return null;
+            }
+            return null;
+        }
+
+        private boolean isTypeVariable(TypeMirror t) {
+            try {
+                // javac hands back a placeholder for a capture, so "spells
+                // like a type variable" is what separates the two -- not an
+                // instanceof test, which both pass.
+                return t instanceof TypeVariable tv && tv.asElement() instanceof TypeParameterElement tp
+                        && SourceVersion.isIdentifier(tp.getSimpleName());
+            } catch (RuntimeException e) {
+                return false;
+            }
+        }
+
         /** A type that carries information and could stand in a declaration. */
         private boolean usable(TypeMirror t) {
             if (t == null) return false;
             return switch (t.getKind()) {
                 case ARRAY, DECLARED -> !isObject(t);
                 case BOOLEAN, BYTE, SHORT, INT, LONG, CHAR, FLOAT, DOUBLE -> true;
-                default -> false; // ERROR (cascade), NULL, VOID, TYPEVAR, INTERSECTION, ...
+                case TYPEVAR -> declarationType(t) != null;
+                default -> false; // ERROR (cascade), NULL, VOID, WILDCARD, INTERSECTION, ...
             };
         }
 
@@ -763,10 +1152,85 @@ final class ObjectTypedLocalFixer {
                 case FIELD -> t.getKind() == TypeKind.DECLARED
                         && hasField((TypeElement) ((DeclaredType) t).asElement(), s.member());
                 case PRIMITIVE -> t.getKind().isPrimitive() || unboxes(t);
+                case PASS -> s.required() != null && types.isAssignable(t, s.required());
+                case PRIMITIVE_ARGUMENT -> true; // the demand is Role.PRIMITIVE's
+                case CAST -> castable(t, s.required());
+                case INSTANCEOF -> instanceOfOk(t, s.required());
+                case COMPARISON -> s.required() != null
+                        && (types.isAssignable(t, s.required()) || types.isAssignable(s.required(), t));
+                // JLS 15.18.1: string conversion accepts a value of any type,
+                // so narrowing the operand cannot make the concatenation stop
+                // compiling -- nor change the String it produces.
+                case CONCAT -> true;
+                case RETURN -> s.required() != null && types.isAssignable(t, s.required());
+                case ARRAY_INDEX -> s.required() != null && unboxesTo(t, s.required());
+                case OTHER -> false; // unclassified: refuse to narrow
             };
         }
 
+        private boolean isString(TypeMirror t) {
+            return t.getKind() == TypeKind.DECLARED
+                    && ((TypeElement) ((DeclaredType) t).asElement())
+                    .getQualifiedName().contentEquals("java.lang.String");
+        }
+
+        /**
+         * Whether {@code t instanceof target} still compiles. javac asks
+         * whether the two types are downcast-compatible (JLS 5.1.6), so
+         * related in either direction is enough -- and otherwise a final
+         * class on <i>either</i> side is fatal, because no type can then be
+         * both: {@code arrayList instanceof String} is rejected by String
+         * being final even though ArrayList is not, and {@code int[] instanceof
+         * String} for the same reason.
+         */
+        private boolean instanceOfOk(TypeMirror t, TypeMirror target) {
+            if (t == null || target == null) return false;
+            if (types.isAssignable(t, target) || types.isAssignable(target, t)) return true;
+            return !isFinal(t) && !isFinal(target);
+        }
+
+        /** Final as a <i>class</i>: an array and a type variable are never one,
+         *  so neither can rule a subtype in or out. */
+        private boolean isFinal(TypeMirror t) {
+            if (t.getKind() != TypeKind.DECLARED) return false;
+            return ((TypeElement) ((DeclaredType) t).asElement()).getModifiers().contains(Modifier.FINAL);
+        }
+
+        /** Whether {@code t} can stand for a value of the primitive {@code p}.
+         *  {@code unboxedType} is the exact inverse of what is being asked, so
+         *  an Integer serves an int index and a Double serves neither it nor
+         *  any other integral one. */
+        private boolean unboxesTo(TypeMirror t, TypeMirror p) {
+            if (t == null || p == null) return false;
+            if (t.getKind() == p.getKind()) return true;
+            if (t.getKind() != TypeKind.DECLARED || !p.getKind().isPrimitive()) return false;
+            try {
+                TypeMirror unboxed = types.unboxedType(t);
+                return unboxed != null && unboxed.getKind() == p.getKind();
+            } catch (IllegalArgumentException e) {
+                return false;
+            }
+        }
+
+        /**
+         * Whether {@code (target) t} still compiles once the declaration
+         * carries {@code t}. JLS 5.5 lets any reference be cast to an
+         * interface, and one reference type to another when either is a
+         * subtype of the other; two unrelated final types are the pair that
+         * stops compiling.
+         */
+        private boolean castable(TypeMirror t, TypeMirror target) {
+            if (t == null || target == null) return false;
+            if (target.getKind() != TypeKind.DECLARED) return false; // a type variable or wildcard is not a cast target
+            if (types.isAssignable(t, target) || types.isAssignable(target, t)) return true;
+            return ((TypeElement) ((DeclaredType) target).asElement()).getKind() == ElementKind.INTERFACE;
+        }
+
         private boolean unboxes(TypeMirror t) {
+            // JLS 5.1.8 unboxes a boxed type. A type variable stands for
+            // whatever it was instantiated with, so unboxedType would answer
+            // for one of those, not for T.
+            if (t.getKind() != TypeKind.DECLARED) return false;
             try {
                 return types.unboxedType(t) != null;
             } catch (IllegalArgumentException e) {
@@ -920,7 +1384,9 @@ final class ObjectTypedLocalFixer {
 
         /** Fully-qualified source text for {@code t}, or null when it can't be
          *  written at this site (type variables, captures, anonymous or
-         *  inaccessible classes) -- in which case the fix is simply skipped. */
+         *  inaccessible classes) -- in which case the fix is simply skipped.
+         *  A type variable is nameable only where a declaration may use one,
+         *  hence {@link #declarationText}. */
         private String render(TypeMirror t, Scope from) {
             switch (t.getKind()) {
                 case BOOLEAN, BYTE, SHORT, INT, LONG, CHAR, FLOAT, DOUBLE:
@@ -946,6 +1412,16 @@ final class ObjectTypedLocalFixer {
                 default:
                     return null;
             }
+        }
+
+        /** Source text for a declaration's type. The only case {@link #render}
+         *  turns down that source can spell is a type variable, which is
+         *  exactly what a capture of a bounded wildcard has to be declared as. */
+        private String declarationText(TypeMirror t, Scope from) {
+            if (t.getKind() == TypeKind.TYPEVAR && isTypeVariable(t)) {
+                return ((TypeVariable) t).asElement().getSimpleName().toString();
+            }
+            return render(t, from);
         }
 
         private String renderArgument(TypeMirror a, Scope from) {

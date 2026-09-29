@@ -282,6 +282,554 @@ class ObjectTypedLocalFixerTest {
         assertTrue(compile(root).success());
     }
 
+    // ---- passing an Object where the callee demands its own type ----
+
+    @Test
+    void retypesALocalPassedWhereTheCalleeDemandsTheAssignedType(@TempDir Path root) throws IOException {
+        write(root, "rs/gui/loadouts/Loadout.java", """
+                package rs.gui.loadouts;
+
+                public class Loadout {
+                }
+                """);
+        write(root, "rs/gui/loadouts/LoadoutList.java", """
+                package rs.gui.loadouts;
+
+                import java.util.ArrayList;
+
+                public class LoadoutList extends ArrayList<Loadout> {
+                }
+                """);
+        write(root, "rs/gui/loadouts/LoadoutFolders.java", """
+                package rs.gui.loadouts;
+
+                import java.util.ArrayList;
+                import java.util.LinkedHashMap;
+                import java.util.List;
+
+                public class LoadoutFolders extends LinkedHashMap<String, LoadoutList> {
+                    public void renameLoadout(String string, Loadout loadout, String string2) {
+                        Object object2;
+                        object2 = new LoadoutList();
+                        for (Loadout loadout2 : (LoadoutList)this.get(string)) {
+                            ((ArrayList)object2).add(loadout2);
+                        }
+                        this.put(string, object2);
+                        save((List<Loadout>)object2);
+                        this.log(object2);
+                    }
+
+                    private void log(Object o) {
+                    }
+
+                    private void save(List<Loadout> list) {
+                    }
+                }
+                """);
+        var result = fix(root);
+        String out = read(root, "rs/gui/loadouts/LoadoutFolders.java");
+        assertTrue(out.contains("LoadoutList object2;"), out);
+        assertEquals(1, result.fixes());
+        assertTrue(compile(root).success(), () -> "tree should compile after one pass: " + out);
+    }
+
+    // ---- the retype must be sound for EVERY use, not only the flagged one ----
+
+    @Test
+    void anInstanceOfThatOnlyCompiledBecauseTheDeclarationWasObjectBlocksTheRetype(@TempDir Path root)
+            throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                public class A {
+                    static int sink(Integer n) {
+                        return n;
+                    }
+
+                    static int hash(Object o) {
+                        return o.hashCode();
+                    }
+
+                    int run() {
+                        Object v = Integer.valueOf(7);
+                        boolean b = v instanceof StringBuilder;
+                        int n = this.hash(v);
+                        n += this.sink(v);
+                        return n + (b ? 1 : 0);
+                    }
+                }
+                """);
+
+        var result = fix(root);
+        String out = read(root, "rs/A.java");
+        assertTrue(out.contains("Object v = Integer.valueOf(7);"),
+                "Integer is final, so 'v instanceof StringBuilder' would stop compiling: " + out);
+        assertTrue(out.contains("this.sink(((Integer) v))"), "the per-use cast is the safe fallback: " + out);
+        assertTrue(result.fixes() > 0);
+        assertTrue(compile(root).success(), () -> "tree should compile after one pass: " + out);
+    }
+
+    @Test
+    void aCastBetweenTwoFinalTypesBlocksTheRetype(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                public class A {
+                    static int sink(Integer n) {
+                        return n;
+                    }
+
+                    static int hash(Object o) {
+                        return o.hashCode();
+                    }
+
+                    int run() {
+                        Object v = Integer.valueOf(7);
+                        String s = (String) v;
+                        int n = this.hash(v);
+                        n += this.sink(v);
+                        return n + s.length();
+                    }
+                }
+                """);
+
+        var result = fix(root);
+        String out = read(root, "rs/A.java");
+        assertTrue(out.contains("Object v = Integer.valueOf(7);"),
+                "Integer and String are both final and unrelated, so the cast would stop compiling: " + out);
+        assertTrue(out.contains("this.sink(((Integer) v))"), "the per-use cast is the safe fallback: " + out);
+        assertTrue(result.fixes() > 0);
+        assertTrue(compile(root).success(), () -> "tree should compile after one pass: " + out);
+    }
+
+    @Test
+    void unflaggedUsesTheNewTypeStillSatisfiesDoNotBlockTheRetype(@TempDir Path root) throws IOException {
+        write(root, "rs/gui/loadouts/Loadout.java", """
+                package rs.gui.loadouts;
+
+                public class Loadout {
+                }
+                """);
+        write(root, "rs/gui/loadouts/LoadoutList.java", """
+                package rs.gui.loadouts;
+
+                import java.util.ArrayList;
+
+                public class LoadoutList extends ArrayList<Loadout> {
+                }
+                """);
+        write(root, "rs/gui/loadouts/LoadoutFolders.java", """
+                package rs.gui.loadouts;
+
+                import java.util.LinkedHashMap;
+
+                public class LoadoutFolders extends LinkedHashMap<String, LoadoutList> {
+                    public void renameLoadout(String string, Loadout loadout) {
+                        Object object2;
+                        object2 = new LoadoutList();
+                        this.put(string, object2);
+                        this.log(object2);
+                    }
+
+                    private void log(Object o) {
+                    }
+                }
+                """);
+
+        var result = fix(root);
+        String out = read(root, "rs/gui/loadouts/LoadoutFolders.java");
+        assertTrue(out.contains("LoadoutList object2;"),
+                "log(Object) and put(String, LoadoutList) both survive the narrowing: " + out);
+        assertEquals(1, result.fixes());
+        assertTrue(compile(root).success(), () -> "tree should compile after one pass: " + out);
+    }
+
+    @Test
+    void thePassFixStillLandsWhenTheCallIsWrappedAcrossLines(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                public class A {
+                    int take(String s) {
+                        return s.length();
+                    }
+
+                    int run() {
+                        Object v = "seed";
+                        int n = this
+                                .take(v);
+                        return n;
+                    }
+                }
+                """);
+
+        var result = fix(root);
+        String out = read(root, "rs/A.java");
+        assertTrue(out.contains("String v = \"seed\";"), out);
+        assertTrue(result.fixes() > 0);
+        assertTrue(compile(root).success(), () -> "tree should compile after one pass: " + out);
+    }
+
+    @Test
+    void declaresAWildcardCaptureAsTheTypeVariableBoundingIt(@TempDir Path root) throws IOException {
+        write(root, "rs/Class306.java", """
+                package rs;
+
+                import java.util.Collections;
+                import java.util.Comparator;
+                import java.util.List;
+
+                public class Class306 {
+                    private static <T> int method2594(List<? extends T> var0, T var1, Comparator<? super T> var2) {
+                        int var3 = Collections.binarySearch(var0, var1, var2);
+                        if (var3 < 0) {
+                            return -var3 - 1;
+                        } else {
+                            for (int var4 = var3 + 1; var4 < var0.size(); var4++) {
+                                Object var5 = var0.get(var4);
+                                int var6 = var2.compare(var5, var1);
+                                if (var6 > 0) {
+                                    return var4;
+                                }
+                            }
+                            return var0.size();
+                        }
+                    }
+                }
+                """);
+
+        var result = fix(root);
+        String out = read(root, "rs/Class306.java");
+        assertTrue(out.contains("T var5 = var0.get(var4);"), out);
+        assertTrue(result.fixes() > 0);
+        assertTrue(compile(root).success(), () -> "tree should compile after one pass: " + out);
+    }
+
+    @Test
+    void refusesWhenTheInitializerHasNoSingleNameableType(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                import java.util.List;
+
+                public class A {
+                    static int take(String s) {
+                        return s.length();
+                    }
+
+                    int run(List<?> names) {
+                        Object v = names.get(0);
+                        return take(v);
+                    }
+                }
+                """);
+        String before = read(root, "rs/A.java");
+        assertEquals(0, fix(root).fixes(), "a capture of an unbounded wildcard has no name to write");
+        assertEquals(before, read(root, "rs/A.java"));
+    }
+
+    @Test
+    void refusesASuperWildcardCaptureAsTheDefType(@TempDir Path root) throws IOException {
+        write(root, "rs/Class306.java", """
+                package rs;
+
+                import java.util.Comparator;
+                import java.util.List;
+
+                public class Class306 {
+                    private static <T> int method2594(List<? super T> var0, T var1, Comparator<? super T> var2) {
+                        for (int var4 = 0; var4 < var0.size(); var4++) {
+                            Object var5 = var0.get(var4);
+                            int var6 = var2.compare(var5, var1);
+                            if (var6 > 0) {
+                                return var4;
+                            }
+                        }
+                        return var0.size();
+                    }
+                }
+                """);
+        String before = read(root, "rs/Class306.java");
+        assertEquals(0, fix(root).fixes(),
+                "only '? extends T' bounds the capture by a type variable; '? super T' bounds it from below");
+        assertEquals(before, read(root, "rs/Class306.java"));
+    }
+
+    @Test
+    void aPrimitiveDemandedArgumentAddsNoConstraint(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                public class A {
+                    static int takeInt(int n) {
+                        return n;
+                    }
+
+                    static int takeString(String s) {
+                        return s.length();
+                    }
+
+                    int run() {
+                        Object v = "seed";
+                        int n = this.takeString(v);
+                        n += this.takeInt(v);
+                        return n;
+                    }
+                }
+                """);
+
+        var result = fix(root);
+        String out = read(root, "rs/A.java");
+        assertTrue(out.contains("String v = \"seed\";"),
+                "an int parameter is not a reason to refuse the whole declaration: " + out);
+        assertTrue(result.fixes() > 0);
+        var remaining = compile(root).diagnostics();
+        assertEquals(1, remaining.size(), "only the unboxable argument is left: " + remaining);
+    }
+
+    @Test
+    void refusesATypeVariableThatWouldHaveToUnbox(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                public class A {
+                    static <T extends Integer> int run(T seed) {
+                        Object v = seed;
+                        boolean b = v == 1;
+                        return b ? 1 : 0;
+                    }
+                }
+                """);
+        String before = read(root, "rs/A.java");
+        assertTrue(compile(root).diagnostics().stream()
+                .anyMatch(d -> d.getMessage(java.util.Locale.ENGLISH).contains("bad operand types")));
+        assertEquals(0, fix(root).fixes(),
+                "JLS 5.1.8 unboxes boxed types, not type variables: T cannot serve a primitive operand");
+        assertEquals(before, read(root, "rs/A.java"));
+    }
+
+    @Test
+    void refusesWhenTheRetypedDeclarationWouldNotFitTheCallee(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                public class A {
+                    static int take(String s) {
+                        return s.length();
+                    }
+
+                    int run() {
+                        Object v = new StringBuilder();
+                        return take(v);
+                    }
+                }
+                """);
+        String before = read(root, "rs/A.java");
+        assertEquals(0, fix(root).fixes(), "StringBuilder is not a String");
+        assertEquals(before, read(root, "rs/A.java"));
+    }
+
+    @Test
+    void leavesPreciseAndGenuinelyObjectDeclarationsUntouched(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                import java.util.List;
+
+                public class A {
+                    static int take(String s) {
+                        return s.length();
+                    }
+
+                    static int any(Object o) {
+                        return o.hashCode();
+                    }
+
+                    int run(List<String> names) {
+                        String first = names.get(0);
+                        Object any = new Object();
+                        return take(first) + any(any);
+                    }
+                }
+                """);
+        String before = read(root, "rs/A.java");
+        assertTrue(compile(root).success());
+        assertEquals(0, fix(root).fixes());
+        assertEquals(before, read(root, "rs/A.java"));
+    }
+
+    @Test
+    void aFinalInstanceOfTargetBlocksTheRetype(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                import java.util.ArrayList;
+
+                public class A {
+                    int run() {
+                        Object v = new ArrayList<String>();
+                        if (v instanceof String) {
+                            return 1;
+                        }
+                        return v.size();
+                    }
+                }
+                """);
+
+        var result = fix(root);
+        String out = read(root, "rs/A.java");
+        assertTrue(out.contains("Object v = new ArrayList<String>();"),
+                "String is final, so narrowing to ArrayList<String> makes the instanceof inconvertible: " + out);
+        assertTrue(out.contains("((ArrayList<String>) v).size()"),
+                "the per-use cast is the safe fallback: " + out);
+        assertTrue(result.fixes() > 0);
+        assertTrue(compile(root).success(), () -> "tree should compile after one pass: " + out);
+    }
+
+    @Test
+    void keepsTheRetypeForAPrimitiveComparison(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                public class A {
+                    int run() {
+                        Object v = Integer.valueOf(1);
+                        boolean b = v == 1;
+                        return b ? 1 : 0;
+                    }
+                }
+                """);
+
+        var result = fix(root);
+        String out = read(root, "rs/A.java");
+        assertTrue(out.contains("Integer v = Integer.valueOf(1);"),
+                "unboxing to the comparison's int is exactly what Integer is for: " + out);
+        assertTrue(result.fixes() > 0);
+        assertTrue(compile(root).success(), () -> "tree should compile after one pass: " + out);
+    }
+
+    @Test
+    void keepsTheRetypeWhenTheVariableIsAlsoReturned(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                public class A {
+                    static int sink(String s) {
+                        return s.length();
+                    }
+
+                    String ret() {
+                        Object v = "seed";
+                        this.sink(v);
+                        return v;
+                    }
+                }
+                """);
+
+        var result = fix(root);
+        String out = read(root, "rs/A.java");
+        assertTrue(out.contains("String v = \"seed\";"), out);
+        assertTrue(result.fixes() > 0);
+        assertTrue(compile(root).success(), () -> "tree should compile after one pass: " + out);
+    }
+
+    @Test
+    void keepsTheRetypeWhenTheVariableIsAlsoConcatenated(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                public class A {
+                    static int sink(String s) {
+                        return s.length();
+                    }
+
+                    String cat() {
+                        Object v = "seed";
+                        this.sink(v);
+                        return "" + v;
+                    }
+                }
+                """);
+
+        var result = fix(root);
+        String out = read(root, "rs/A.java");
+        assertTrue(out.contains("String v = \"seed\";"), out);
+        assertTrue(result.fixes() > 0);
+        assertTrue(compile(root).success(), () -> "tree should compile after one pass: " + out);
+    }
+
+    @Test
+    void keepsTheRetypeWhenTheVariableIsAlsoAnArrayIndex(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                public class A {
+                    static int sinkNumber(Number n) {
+                        return n.intValue();
+                    }
+
+                    int idx(int[] arr) {
+                        Object v = Integer.valueOf(1);
+                        this.sinkNumber(v);
+                        return arr[v];
+                    }
+                }
+                """);
+
+        var result = fix(root);
+        String out = read(root, "rs/A.java");
+        assertTrue(out.contains("Integer v = Integer.valueOf(1);"),
+                "Integer is a Number and unboxes to an int index: " + out);
+        assertTrue(result.fixes() > 0);
+        assertTrue(compile(root).success(), () -> "tree should compile after one pass: " + out);
+    }
+
+    @Test
+    void refusesToCastToAPrimitiveTheBoxedSlotCannotYield(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                public class A {
+                    int run() {
+                        Object v = 1;
+                        boolean b = v == 1;
+                        return b ? 1 : 0;
+                    }
+                }
+                """);
+        String before = read(root, "rs/A.java");
+        assertEquals(0, fix(root).fixes(),
+                "the slot holds a boxed Integer: ((int) v) would compile and then throw");
+        assertEquals(before, read(root, "rs/A.java"));
+    }
+
+    @Test
+    void stillCastsToTheBoxedTypeReachingTheDefinition(@TempDir Path root) throws IOException {
+        write(root, "rs/A.java", """
+                package rs;
+
+                public class A {
+                    int run(boolean flag) {
+                        Object v;
+                        if (flag) {
+                            v = 1.5;
+                        }
+                        v = Integer.valueOf(1);
+                        boolean b = v == 1;
+                        return b ? 1 : 0;
+                    }
+                }
+                """);
+
+        var result = fix(root);
+        String out = read(root, "rs/A.java");
+        assertTrue(out.contains("Object v;"), "two unrelated assignment types: no single type to declare");
+        assertTrue(out.contains("((Integer) v) == 1"),
+                "the reaching definition is a boxed Integer, so casting to Integer is safe: " + out);
+        assertTrue(result.fixes() > 0);
+        assertTrue(compile(root).success(), () -> "tree should compile after one pass: " + out);
+    }
+
     // ---- inference from demand when no assignment has a usable type ----
 
     @Test
