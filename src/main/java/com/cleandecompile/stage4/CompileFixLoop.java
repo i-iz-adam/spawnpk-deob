@@ -2444,8 +2444,9 @@ public final class CompileFixLoop {
     static final class CheckedWrapFixer {
         private static final Pattern UNREPORTED = Pattern.compile(
                 "unreported exception ([\\w.$]+); must be caught or declared to be thrown");
+        // 'synchronized (lock) {' is a block, but 'synchronized int m(..) {' is a method header.
         private static final Pattern METHOD_HEADER = Pattern.compile(
-                "^\\s*+(?!if\\b|for\\b|while\\b|switch\\b|catch\\b|synchronized\\b|do\\b|else\\b|try\\b)(?:(?:public|private|protected|static|final|synchronized|native|abstract|strictfp)\\s+)*[\\w.$<>\\[\\],? ]*\\w+\\s*\\([^;{}]*\\)\\s*(?:throws\\s+[\\w., ]+)?\\s*\\{?\\s*$");
+                "^\\s*+(?!if\\b|for\\b|while\\b|switch\\b|catch\\b|synchronized\\s*\\(|do\\b|else\\b|try\\b)(?:(?:public|private|protected|static|final|synchronized|native|abstract|strictfp)\\s+)*[\\w.$<>\\[\\],? ]*\\w+\\s*\\([^;{}]*\\)\\s*(?:throws\\s+[\\w., ]+)?\\s*\\{?\\s*$");
 
         static int tryFixAll(Path sourceRoot, List<DiagnosticBucketer.Bucketed> bucketed) throws IOException {
             Map<Path, List<Diagnostic<? extends JavaFileObject>>> byFile = new LinkedHashMap<>();
@@ -2478,20 +2479,26 @@ public final class CompileFixLoop {
             List<Diagnostic<? extends JavaFileObject>> ordered = new ArrayList<>(diags);
             ordered.sort((a, b) -> Long.compare(b.getLineNumber(), a.getLineNumber()));
             int fixed = 0;
+            // (method header line, exception) pairs already wrapped this pass: a
+            // second diagnostic for the same exception in the same method is
+            // covered by the first wrap (the try encloses the whole body), and
+            // wrapping again would nest a catch for an exception the inner try
+            // already handled -- "never thrown in body of corresponding try".
+            Set<String> wrapped = new HashSet<>();
             for (var d : ordered) {
                 Matcher m = UNREPORTED.matcher(d.getMessage(Locale.ENGLISH));
                 if (!m.find()) continue;
                 String exception = m.group(1);
                 int lineNo = (int) d.getLineNumber();
                 if (lineNo < 1 || lineNo > lines.size()) continue;
-                if (wrap(lines, file, lineNo, exception)) fixed++;
+                if (wrap(lines, file, lineNo, exception, wrapped)) fixed++;
             }
             if (fixed > 0) Files.write(file, lines);
             return fixed;
         }
 
-        private static boolean wrap(List<String> lines, Path file, int lineNo, String exception)
-                throws IOException {
+        private static boolean wrap(List<String> lines, Path file, int lineNo, String exception,
+                                    Set<String> wrapped) throws IOException {
             String simple = exception.contains(".") ? exception.substring(exception.lastIndexOf('.') + 1)
                     : exception;
             // Enclosing method header above the diagnostic.
@@ -2540,31 +2547,52 @@ public final class CompileFixLoop {
             if (openLine < 0 || closeLine < 0 || lineNo - 1 <= openLine || lineNo - 1 >= closeLine) {
                 return false;
             }
-            // Wrapping the whole body in try/catch leaves the catch path
-            // without a return value: only safe for void methods (and
-            // constructors), whose only legal returns are bare. A value
-            // return would trade the unreported exception for a missing
-            // return statement.
+            // Already wrapped for this exception by an earlier (deeper) diagnostic.
+            if (!wrapped.add(header + ":" + exception)) return true;
+            // A void method (or constructor) can simply swallow the exception:
+            // the catch path falls off the end like any other. A value
+            // return cannot -- the catch path would have no value, trading
+            // the unreported exception for a missing-return error -- so
+            // there the catch rethrows instead (unchecked), which needs no
+            // value and keeps the failure loud rather than inventing a
+            // fallback result.
+            boolean returnsValue = false;
             for (int i = openLine; i <= closeLine; i++) {
                 if (Pattern.compile("\\breturn\\s+[^;\\s]").matcher(stripLine(lines.get(i))).find()) {
-                    return false;
+                    returnsValue = true;
+                    break;
                 }
             }
             String indent = lines.get(header).substring(0,
                     lines.get(header).length() - lines.get(header).stripLeading().length());
             lines.add(openLine + 1, indent + "   try {");
             // Insertion shifted the close line down by one.
-            lines.add(closeLine + 1, indent + "   } catch (" + simple + " ignored) {");
-            lines.add(closeLine + 2, indent + "   }");
+            if (returnsValue) {
+                lines.add(closeLine + 1, indent + "   } catch (" + simple + " stage4Checked) {");
+                lines.add(closeLine + 2, indent + "      throw " + rethrow(exception, simple));
+            } else {
+                lines.add(closeLine + 1, indent + "   } catch (" + simple + " ignored) {");
+            }
+            lines.add(returnsValue ? closeLine + 3 : closeLine + 2, indent + "   }");
             if (!simple.equals(exception) || exception.contains(".")) {
                 ensureImport(lines, exception);
             }
             return true;
         }
 
+        /** {@code IOException} keeps its type's unchecked twin; anything else is wrapped. */
+        private static String rethrow(String exception, String simple) {
+            if (exception.equals("java.io.IOException") || exception.equals("IOException")) {
+                return "new java.io.UncheckedIOException(stage4Checked);";
+            }
+            return "new RuntimeException(stage4Checked);";
+        }
+
         private static void ensureImport(List<String> lines, String fqn) {
             if (!fqn.contains(".")) return;
-            if (fqn.startsWith("java.lang.")) return;
+            // Only direct members of java.lang are implicit; java.lang.reflect.*,
+            // java.lang.invoke.* etc. are ordinary packages that need the import.
+            if (fqn.startsWith("java.lang.") && fqn.indexOf('.', "java.lang.".length()) < 0) return;
             String simple = fqn.substring(fqn.lastIndexOf('.') + 1);
             for (String line : lines) {
                 String trimmed = line.trim();
