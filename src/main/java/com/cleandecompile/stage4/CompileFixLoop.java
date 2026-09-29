@@ -462,10 +462,25 @@ public final class CompileFixLoop {
                 VoidAbstractStubFixer.tryFixAll(sourceRoot, bucketed);
         int voidAbstractFixes = voidAbstractFix.fixes();
         fixes += voidAbstractFixes;
+        bucketed = voidAbstractFix.unhandled(bucketed);
+
+        // Whatever abstract-method gaps remain: forward to the renamed
+        // override Stage 0 left behind, or (for a few JDK layout hooks with a
+        // canonical answer) a marked default. Inserts lines, so it runs last.
+        MissingOverrideFixer.Result missingOverrideFix =
+                MissingOverrideFixer.tryFixAll(sourceRoot, bucketed, classpath);
+        int missingOverrideFixes = missingOverrideFix.fixes();
+        fixes += missingOverrideFixes;
+        if (missingOverrideFix.curated() > 0) {
+            System.out.printf("  NOTE: %d synthesized default(s) -- search sources for TODO(stage4)%n",
+                    missingOverrideFix.curated());
+        }
 
         if (fixes > 0) {
-            System.out.printf("  fixes applied: diamond=%d arrayRetype=%d split=%d objectTyped=%d lambdaRestore=%d memberResolution=%d collectionSource=%d inferredType=%d residualSyntax=%d duplicateLocal=%d residualAccess=%d imports=%d concat=%d casts=%d artifacts=%d compare=%d widen=%d receiver=%d wrap=%d voidAbstractStub=%d%n",
-                    diamondFixes, arrayFixes, splitFixes, objectFixes, lambdaFixes, memberFixes, collectionFixes, inferredTypeFixes, residualSyntaxFixes, duplicateFixes, residualFixes, importFixes, concatFixes, castFixes, artifactFixes, compareFixes, widenFixes, receiverFixes, wrapFixes, voidAbstractFixes);
+            System.out.printf("  fixes applied: diamond=%d arrayRetype=%d split=%d objectTyped=%d lambdaRestore=%d memberResolution=%d collectionSource=%d inferredType=%d residualSyntax=%d duplicateLocal=%d residualAccess=%d imports=%d concat=%d casts=%d artifacts=%d repeatable=%d compare=%d widen=%d receiver=%d wrap=%d voidAbstractStub=%d primitiveCoercion=%d genericCast=%d missingOverride=%d enumRestore=%d enumCaseLabel=%d unreachableCatch=%d%n",
+                    diamondFixes, arrayFixes, splitFixes, objectFixes, lambdaFixes, memberFixes, collectionFixes, inferredTypeFixes, residualSyntaxFixes, duplicateFixes, residualFixes, importFixes, concatFixes, castFixes, artifactFixes, repeatableContainerFixes, compareFixes, widenFixes, receiverFixes, wrapFixes, voidAbstractFixes,
+                    primitiveCoercionFixes, genericCastFixes, missingOverrideFixes,
+                    enumRestoreFixes, enumCaseLabelFixes, unreachableCatchFixes);
         }
 
         // TODO: DUPLICATE_METHOD -- remove the redundant bridge method
