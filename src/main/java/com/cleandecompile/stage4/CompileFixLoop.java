@@ -2795,12 +2795,30 @@ public final class CompileFixLoop {
                         || trimmed.equals("import static " + fqn + ";")) return;
                 if (trimmed.matches("import\\s+[\\w.$]+\\." + Pattern.quote(simple) + "\\s*;")) return; // collision
             }
-            int insertAt = 0;
+            int insertAt = -1;
+            boolean inBlockComment = false;
             for (int i = 0; i < lines.size(); i++) {
                 String trimmed = lines.get(i).trim();
-                if (trimmed.startsWith("package ") || trimmed.startsWith("import ")) insertAt = i + 1;
-                else if (!trimmed.isEmpty() && !trimmed.startsWith("//")) break;
+                // Skip the decompiler's banner: it is a /* ... */ block that
+                // sits ABOVE the package declaration, and stopping at its
+                // opening line would place the import above `package`, which
+                // stops the file parsing at all.
+                if (inBlockComment) {
+                    if (trimmed.contains("*/")) inBlockComment = false;
+                    continue;
+                }
+                if (trimmed.startsWith("/*")) {
+                    if (!trimmed.contains("*/")) inBlockComment = true;
+                    continue;
+                }
+                if (trimmed.startsWith("//") || trimmed.isEmpty()) continue;
+                if (trimmed.startsWith("package ") || trimmed.startsWith("import ")) {
+                    insertAt = i + 1;
+                    continue;
+                }
+                break; // first real type declaration: imports all belong above it
             }
+            if (insertAt < 0) return; // no package/import header to anchor to
             lines.add(insertAt, "import " + fqn + ";");
         }
     }

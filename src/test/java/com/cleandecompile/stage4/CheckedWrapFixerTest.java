@@ -222,4 +222,46 @@ class CheckedWrapFixerTest {
 
         assertEquals(0, fixed);
     }
+
+    /**
+     * Every decompiled file opens with the decompiler's own banner comment,
+     * so the import has to go after the {@code package} line that follows it.
+     * Inserting at the top instead puts the import above {@code package},
+     * which is not a parse error javac can report usefully -- the file simply
+     * stops parsing and every one of its diagnostics becomes noise.
+     */
+    @Test
+    void importGoesAfterThePackageLineNotAboveTheDecompilerBanner(@TempDir Path root) throws IOException {
+        write(root, "rs/Client.java", """
+                /*
+                 * Decompiled with CFR 0.152.
+                 *
+                 * Could not load the following classes:
+                 *  java.applet.AppletContext
+                 */
+                package rs;
+
+                import java.io.RandomAccessFile;
+
+                public class Client {
+                    private synchronized int pos(RandomAccessFile file) {
+                        file.seek(0L);
+                        return 1;
+                    }
+                }
+                """);
+
+        var outcome = javac.compile(root, root.resolveSibling("classes"), List.of(), "17");
+        assertTrue(outcome.diagnostics().size() > 0, "expected unreported-exception error");
+        assertTrue(CompileFixLoop.CheckedWrapFixer.tryFixAll(
+                root, bucketer.categorize(outcome.diagnostics())) > 0);
+
+        String updated = Files.readString(root.resolve("rs/Client.java"));
+        int packageAt = updated.indexOf("package rs;");
+        int importAt = updated.indexOf("import java.io.IOException;");
+        assertTrue(importAt > packageAt,
+                "import must follow the package declaration:\n" + updated);
+        assertTrue(javac.compile(root, root.resolveSibling("classes2"), List.of(), "17").success(),
+                "the fixed file must still compile:\n" + updated);
+    }
 }
