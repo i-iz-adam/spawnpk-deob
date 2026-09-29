@@ -430,6 +430,15 @@ public final class CompileFixLoop {
         int artifactFixes = DecompilerArtifactFixer.tryFixAll(sourceRoot);
         fixes += artifactFixes;
 
+        // JLS 9.6.3 names the @Repeatable container's element `value`, which
+        // Stage 0's element renaming took away: javac drops the whole
+        // @Repeatable reference, and with it the container's own file.
+        RepeatableContainerFixer.Result repeatableFix =
+                RepeatableContainerFixer.tryFixAll(sourceRoot, bucketed);
+        int repeatableContainerFixes = repeatableFix.fixes();
+        fixes += repeatableContainerFixes;
+        bucketed = repeatableFix.unhandled(bucketed);
+
         // Vineflower collapses String.compareTo orderings into bare
         // operators (String > String), which cannot compile; the printed
         // operator faithfully guides the reconstruction (... > 0).
@@ -1420,6 +1429,158 @@ public final class CompileFixLoop {
                 }
             }
             return fixed;
+        }
+    }
+
+    /**
+     * Restores the one annotation element name the JLS does not let a
+     * decompiler rename. Stage 0 renames annotation elements, so a
+     * {@code @Repeatable} container comes out as {@code PluginDependency[] a();}
+     * -- but JLS 9.6.3 fixes the container's element name: it must declare a
+     * no-arg {@code value()} returning the repeatable type as an array.
+     * javac rejects the whole @Repeatable reference for the lack of it
+     * ("... is not a valid @Repeatable, no value element method declared"),
+     * which also takes the container's own file out of the tree.
+     *
+     * <p>The name is mandated rather than guessed, so the element of the
+     * container the diagnostic names is renamed -- and only there: the
+     * repeatable's own elements are ordinary members javac is happy with.
+     * Line-scoped and idempotent, and it declines when the container already
+     * declares a {@code value} element, when it has more than one no-arg
+     * array-returning member, when that member's array is not the repeatable
+     * type (renaming it would only trade this error for another), and when
+     * the old name is referenced anywhere the rename would not carry it.
+     */
+    static final class RepeatableContainerFixer {
+        private static final Pattern NOT_REPEATABLE = Pattern.compile(
+                "([\\w.$]+) is not a valid @Repeatable, no value element method declared[.;]?$");
+        private static final Pattern ANNOTATION_TYPE = Pattern.compile(
+                "^\\s*(?:(?:public|protected|private|static|final|abstract|strictfp)\\s+)*@interface\\s+(\\w+)\\b");
+        private static final Pattern ELEMENT = Pattern.compile(
+                "^\\s*(?:@\\w+(?:\\([^()]*\\))?\\s+)*(?:(?:public|abstract|static|final)\\s+)*"
+                        + "(\\S+)\\s+(\\w+)\\s*\\(\\s*\\)\\s*(?:default\\s+[^;]*)?;\\s*$");
+
+        record Result(int fixes, List<Diagnostic<? extends JavaFileObject>> handled) {
+            List<DiagnosticBucketer.Bucketed> unhandled(List<DiagnosticBucketer.Bucketed> all) {
+                if (handled.isEmpty()) return all;
+                return all.stream().filter(b -> !handled.contains(b.diagnostic())).toList();
+            }
+
+            static final Result NONE = new Result(0, List.of());
+        }
+
+        private RepeatableContainerFixer() {
+        }
+
+        static Result tryFixAll(Path sourceRoot, List<DiagnosticBucketer.Bucketed> bucketed) throws IOException {
+            Map<Path, List<DiagnosticBucketer.Bucketed>> byFile = new LinkedHashMap<>();
+            for (var b : bucketed) {
+                if (b.diagnostic().getSource() == null) continue;
+                Path file;
+                try {
+                    file = Path.of(b.diagnostic().getSource().toUri()).toAbsolutePath().normalize();
+                } catch (RuntimeException e) {
+                    continue;
+                }
+                if (!file.startsWith(sourceRoot.toAbsolutePath().normalize())) continue;
+                byFile.computeIfAbsent(file, f -> new ArrayList<>()).add(b);
+            }
+            int fixed = 0;
+            List<Diagnostic<? extends JavaFileObject>> handled = new ArrayList<>();
+            for (var entry : byFile.entrySet()) {
+                for (var b : entry.getValue()) {
+                    Matcher m = NOT_REPEATABLE.matcher(b.diagnostic().getMessage(Locale.ENGLISH).strip());
+                    if (!m.matches()) continue;
+                    String repeatable = annotationType(entry.getKey());
+                    if (repeatable == null) continue;
+                    if (!renameContainer(sourceRoot, entry.getKey(), m.group(1), repeatable)) continue;
+                    fixed++;
+                    handled.add(b.diagnostic());
+                }
+            }
+            return fixed == 0 ? Result.NONE : new Result(fixed, handled);
+        }
+
+        /**
+         * Renames the container's array element to {@code value}, or false when
+         * the container leaves any doubt about which element was meant.
+         *
+         * <p>Bounded to the container's own class body: a same-shaped member
+         * in a sibling class is a different type's element, and renaming that
+         * would leave the reported error in place while adding a bogus
+         * {@code value()} to the wrong class. The old name must also be
+         * unreferenced -- a rename is a blind splice, so a {@code d.a()} call
+         * elsewhere in the file would stop resolving.
+         */
+        private static boolean renameContainer(Path sourceRoot, Path erroring, String container,
+                                               String repeatable) throws IOException {
+            Path file = VoidAbstractStubFixer.ownerSource(sourceRoot, erroring, container);
+            if (file == null) return false;
+            List<String> lines = new ArrayList<>(Files.readAllLines(file));
+            List<String> code = LambdaRestoreFixer.lexicalLines(lines);
+            int declaration = declarationLine(code, VoidAbstractStubFixer.simpleName(container));
+            if (declaration < 0) return false;
+            int close = VoidAbstractStubFixer.classBodyEnd(code, declaration);
+            if (close < 0) return false;
+            int candidate = -1;
+            int arrays = 0;
+            for (int i = declaration + 1; i < close; i++) {
+                Matcher e = ELEMENT.matcher(code.get(i));
+                if (!e.matches()) continue;
+                if ("value".equals(e.group(2))) return false; // the mandated name is taken
+                if (!e.group(1).endsWith("[]")) continue;
+                candidate = i;
+                arrays++;
+            }
+            if (arrays != 1) return false;
+            Matcher e = ELEMENT.matcher(code.get(candidate));
+            if (!e.matches()) return false;
+            String component = e.group(1).replaceAll("\\s*\\[\\]$", "");
+            if (!VoidAbstractStubFixer.simpleName(component).equals(repeatable)) return false;
+            if (referencedElsewhere(code, candidate, e.group(2))) return false;
+            String line = lines.get(candidate);
+            lines.set(candidate, line.substring(0, e.start(2)) + "value" + line.substring(e.end(2)));
+            Files.write(file, lines);
+            return true;
+        }
+
+        /** The line the named annotation type is declared on. */
+        private static int declarationLine(List<String> code, String simpleName) {
+            for (int i = 0; i < code.size(); i++) {
+                Matcher m = ANNOTATION_TYPE.matcher(code.get(i));
+                if (m.find() && m.group(1).equals(simpleName)) return i;
+            }
+            return -1;
+        }
+
+        /**
+         * Whether the element name occurs anywhere it would not survive the
+         * rename: on any other line, or more than once on the declaration line
+         * itself. The second case is an annotation applied to the element
+         * ({@code @Marker(a = 1) PluginDependency[] a();}), which the
+         * declaration line carries and a line-granular scan skipped.
+         */
+        private static boolean referencedElsewhere(List<String> code, int declaration, String name) {
+            Pattern word = Pattern.compile("\\b" + Pattern.quote(name) + "\\b");
+            for (int i = 0; i < code.size(); i++) {
+                Matcher m = word.matcher(code.get(i));
+                int seen = 0;
+                while (m.find()) {
+                    if (i != declaration) return true;
+                    if (++seen > 1) return true;
+                }
+            }
+            return false;
+        }
+
+        /** The annotation type a file declares: the repeatable whose
+         *  {@code @Repeatable} reference javac just rejected. */
+        private static String annotationType(Path file) throws IOException {
+            for (String line : LambdaRestoreFixer.lexicalLines(Files.readAllLines(file))) {
+                Matcher m = ANNOTATION_TYPE.matcher(line);
+                if (m.find()) return m.group(1);
+            }
+            return null;
         }
     }
 
