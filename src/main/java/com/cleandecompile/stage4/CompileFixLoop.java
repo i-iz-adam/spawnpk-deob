@@ -43,6 +43,11 @@ public final class CompileFixLoop {
 
     private final DiagnosticBucketer bucketer = new DiagnosticBucketer();
 
+    /** Fixers that edit by javac's diagnostic span; see {@link SpanFixers}. */
+    private static final List<SpanFixers.Planner> SPAN_PLANNERS =
+            List.of(new PrimitiveCoercionFixer(), new GenericCastFixer(),
+                    new EnumRestoreFixer(), new EnumCaseLabelFixer(), new UnreachableCatchFixer());
+
     public record IterationSummary(int iteration, int errorCountBefore, int errorCountAfter, int autoFixesApplied,
                                    int revertedFileCount) {}
 
@@ -301,6 +306,20 @@ public final class CompileFixLoop {
     private int applyMechanicalFixes(Path sourceRoot, List<DiagnosticBucketer.Bucketed> bucketed,
                                      List<Path> classpath, String releaseLevel) throws IOException {
         int fixes = 0;
+
+        // Span-driven fixers go FIRST: they locate their target by javac's
+        // own character offsets, which are only valid against the text javac
+        // compiled. Every later fixer edits by line and may shift content, so
+        // nothing may touch these files before this pass. (Their edits stay
+        // within a line, so the line numbers the later fixers use survive.)
+        SpanFixers.Result spanFix = SpanFixers.run(sourceRoot, bucketed, SPAN_PLANNERS);
+        int primitiveCoercionFixes = spanFix.count(PrimitiveCoercionFixer.NAME);
+        int genericCastFixes = spanFix.count(GenericCastFixer.NAME);
+        int enumRestoreFixes = spanFix.count(EnumRestoreFixer.NAME);
+        int enumCaseLabelFixes = spanFix.count(EnumCaseLabelFixer.NAME);
+        int unreachableCatchFixes = spanFix.count(UnreachableCatchFixer.NAME);
+        fixes += spanFix.fixes();
+        bucketed = spanFix.unhandled(bucketed);
 
         // A raw new-through-parameterized-target poisons every downstream
         // use (lambda params infer Object). Runs FIRST: restoring the
